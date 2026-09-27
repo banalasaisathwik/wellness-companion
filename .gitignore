@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+
+# Node.js
+node_modules/
+
+# Build output
+build/
+dist/
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
