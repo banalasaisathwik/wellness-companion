@@ -10,20 +10,67 @@ import {
   Track,
   type TranscriptionSegment,
 } from 'livekit-client'
+import { belongsToSession, mergeTurnMetrics, selectAssistantItem, type AssistantItem, type TurnLatency } from './reliability'
 import './App.css'
 
 type Transcript = { id: string; text: string }
-type TimelineEvent = { id: number; message: string }
+type TimelineEvent = {
+  id: number
+  type: string
+  timestamp: string
+  sessionElapsedSeconds: number | null
+  message: string
+  details?: string
+}
 type AudioPlaybackState = {
   status: string
   error: string
 }
-type TurnLatency = {
-  llmFirstToken: number
-  llmDuration: number
-  ttsFirstAudio: number
-  ttsDuration: number
-  speechEndToAgentAudio: number
+type CurrentTurnDiagnostics = {
+  speechSpan: number | null
+  speechEndToTurnDecision: number | null
+  speechEndToFinalTranscript: number | null
+  turnCommitToAgentThinking: number | null
+}
+type TurnConfiguration = {
+  vad: string
+  vadMinSilence: number | null
+  turnDetection: string
+  turnDetectionModel: string
+  endpointingMode: string
+  endpointingModeSource: string
+  minEndpointingDelay: number | null
+  minEndpointingDelaySource: string
+  maxEndpointingDelay: number | null
+  maxEndpointingDelaySource: string
+  preemptiveGenerationEnabled: boolean
+}
+type LatestProviderMetric = {
+  metricType: string
+  speechId: string | null
+  values: string
+}
+type InterruptionDiagnostics = {
+  overlap: string
+  detectionDelay: number | null
+  predictionDuration: number | null
+  totalDuration: number | null
+  probability: number | null
+  requestCount: number | null
+  assistantResponse: string
+  falseInterruptionResumed: string
+  userSpeechToAgentStopped: number | null
+}
+const emptyInterruptionDiagnostics: InterruptionDiagnostics = {
+  overlap: 'Unavailable',
+  detectionDelay: null,
+  predictionDuration: null,
+  totalDuration: null,
+  probability: null,
+  requestCount: null,
+  assistantResponse: 'Unavailable',
+  falseInterruptionResumed: 'Unavailable',
+  userSpeechToAgentStopped: null,
 }
 
 function isDiagnostic(message: unknown): message is Record<string, unknown> & { type: string } {
@@ -34,22 +81,74 @@ function formatMilliseconds(value: number | null) {
   return value === null ? '—' : `${(value * 1000).toFixed(0)} ms`
 }
 
-function readTurnLatency(message: Record<string, unknown>): TurnLatency | null {
-  const values = [
-    message.llm_first_token_seconds,
-    message.llm_duration_seconds,
-    message.tts_first_audio_seconds,
-    message.tts_duration_seconds,
-    message.speech_end_to_agent_audio_seconds,
-  ]
-  if (!values.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0)) return null
+function readNonNegativeNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function formatClockTimestamp(date: Date) {
+  return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}.${date.getMilliseconds().toString().padStart(3, '0')}`
+}
+
+function readTurnConfiguration(value: unknown): TurnConfiguration | null {
+  if (typeof value !== 'object' || value === null) return null
+  const configuration = value as Record<string, unknown>
+  if (
+    typeof configuration.vad !== 'string'
+    || typeof configuration.turn_detection !== 'string'
+    || typeof configuration.turn_detection_model !== 'string'
+    || typeof configuration.endpointing_mode !== 'string'
+    || typeof configuration.preemptive_generation_enabled !== 'boolean'
+  ) return null
 
   return {
-    llmFirstToken: values[0] as number,
-    llmDuration: values[1] as number,
-    ttsFirstAudio: values[2] as number,
-    ttsDuration: values[3] as number,
-    speechEndToAgentAudio: values[4] as number,
+    vad: configuration.vad,
+    vadMinSilence: readNonNegativeNumber(configuration.vad_min_silence_seconds),
+    turnDetection: configuration.turn_detection,
+    turnDetectionModel: configuration.turn_detection_model,
+    endpointingMode: configuration.endpointing_mode,
+    endpointingModeSource: typeof configuration.endpointing_mode_source === 'string' ? configuration.endpointing_mode_source : 'unknown',
+    minEndpointingDelay: readNonNegativeNumber(configuration.min_endpointing_delay_seconds),
+    minEndpointingDelaySource: typeof configuration.min_endpointing_delay_source === 'string' ? configuration.min_endpointing_delay_source : 'unknown',
+    maxEndpointingDelay: readNonNegativeNumber(configuration.max_endpointing_delay_seconds),
+    maxEndpointingDelaySource: typeof configuration.max_endpointing_delay_source === 'string' ? configuration.max_endpointing_delay_source : 'unknown',
+    preemptiveGenerationEnabled: configuration.preemptive_generation_enabled,
+  }
+}
+
+function readTurnLatency(message: Record<string, unknown>): TurnLatency | null {
+  const latency: TurnLatency = {}
+  const fields = [
+    ['llm_first_token_seconds', 'llmFirstToken'],
+    ['llm_duration_seconds', 'llmDuration'],
+    ['tts_first_audio_seconds', 'ttsFirstAudio'],
+    ['tts_duration_seconds', 'ttsDuration'],
+    ['speech_end_to_agent_audio_seconds', 'speechEndToAgentAudio'],
+  ] as const
+
+  for (const [source, target] of fields) {
+    const value = readNonNegativeNumber(message[source])
+    if (value !== null) latency[target] = value
+  }
+  return Object.keys(latency).length ? latency : null
+}
+
+function readLatestProviderMetric(message: Record<string, unknown>): LatestProviderMetric | null {
+  if (typeof message.metric_type !== 'string') return null
+  const values = [
+    ['llm_duration_seconds', 'LLM duration'],
+    ['tts_duration_seconds', 'TTS duration'],
+    ['llm_first_token_seconds', 'LLM first token'],
+    ['tts_first_audio_seconds', 'TTS first audio'],
+  ]
+    .flatMap(([key, label]) => {
+      const value = readNonNegativeNumber(message[key])
+      return value === null ? [] : [`${label} ${formatMilliseconds(value)}`]
+    })
+  if (!values.length) return null
+  return {
+    metricType: message.metric_type,
+    speechId: typeof message.speech_id === 'string' ? message.speech_id : null,
+    values: values.join(', '),
   }
 }
 
@@ -74,6 +173,18 @@ function App() {
   const [agentActivity, setAgentActivity] = useState('Waiting for session')
   const [llmModel, setLlmModel] = useState('Unavailable')
   const [turnLatency, setTurnLatency] = useState<TurnLatency | null>(null)
+  const [activeSpeechId, setActiveSpeechId] = useState<string | null>(null)
+  const [interruptedResponseCount, setInterruptedResponseCount] = useState(0)
+  const [latestProviderMetric, setLatestProviderMetric] = useState<LatestProviderMetric | null>(null)
+  const [currentTurnDiagnostics, setCurrentTurnDiagnostics] = useState<CurrentTurnDiagnostics>({
+    speechSpan: null,
+    speechEndToTurnDecision: null,
+    speechEndToFinalTranscript: null,
+    turnCommitToAgentThinking: null,
+  })
+  const [turnConfiguration, setTurnConfiguration] = useState<TurnConfiguration | null>(null)
+  const [interruptionMode, setInterruptionMode] = useState('Unavailable')
+  const [interruptionDiagnostics, setInterruptionDiagnostics] = useState<InterruptionDiagnostics>(emptyInterruptionDiagnostics)
   const [usage, setUsage] = useState('Unavailable')
   const [audioPlayback, setAudioPlayback] = useState<AudioPlaybackState>({
     status: 'Remote audio track unavailable',
@@ -89,8 +200,12 @@ function App() {
   const remoteAudioElementsRef = useRef(new Map<string, HTMLMediaElement>())
   const audioPlaybackErrorRef = useRef('')
   const finalTranscriptIdsRef = useRef(new Set<string>())
-  const latestAssistantItemIdRef = useRef<string | null>(null)
-  const pendingTurnLatenciesRef = useRef(new Map<string, TurnLatency>())
+  const completedTurnLatenciesRef = useRef(new Map<string, TurnLatency>())
+  const latestCompletedTurnRef = useRef<{ itemId: string; sequence: number } | null>(null)
+  const latestSpeechSequenceRef = useRef(0)
+  const latestAssistantItemRef = useRef<AssistantItem | null>(null)
+  const finishedSpeechIdsRef = useRef(new Set<string>())
+  const interruptedItemIdsRef = useRef(new Set<string>())
   const timelineIdRef = useRef(0)
   const microphoneAnalyserTimerRef = useRef<number | null>(null)
   const microphoneAnalyserRef = useRef<ReturnType<typeof createAudioAnalyser> | null>(null)
@@ -116,8 +231,15 @@ function App() {
       .replace(/\b((?:token|api[ _-]?secret)\s*[=:]\s*)\S+/gi, '$1[redacted]')
   }
 
-  function addDiagnosticTimelineEvent(message: string) {
-    const event = { id: timelineIdRef.current, message }
+  function addDiagnosticTimelineEvent(type: string, message: string, diagnostic: Record<string, unknown>, details?: string) {
+    const event: TimelineEvent = {
+      id: timelineIdRef.current,
+      type,
+      timestamp: formatClockTimestamp(new Date()),
+      sessionElapsedSeconds: readNonNegativeNumber(diagnostic.session_elapsed_seconds),
+      message,
+      details,
+    }
     timelineIdRef.current += 1
     setDiagnosticTimeline((events) => [...events.slice(-29), event])
   }
@@ -133,14 +255,30 @@ function App() {
     setAgentActivity('Waiting for session')
     setLlmModel('Unavailable')
     setTurnLatency(null)
+    setActiveSpeechId(null)
+    setInterruptedResponseCount(0)
+    setLatestProviderMetric(null)
+    setCurrentTurnDiagnostics({
+      speechSpan: null,
+      speechEndToTurnDecision: null,
+      speechEndToFinalTranscript: null,
+      turnCommitToAgentThinking: null,
+    })
+    setTurnConfiguration(null)
+    setInterruptionMode('Unavailable')
+    setInterruptionDiagnostics(emptyInterruptionDiagnostics)
     setUsage('Unavailable')
     setAudioPlayback({
       status: 'Remote audio track unavailable',
       error: '',
     })
     audioPlaybackErrorRef.current = ''
-    latestAssistantItemIdRef.current = null
-    pendingTurnLatenciesRef.current.clear()
+    completedTurnLatenciesRef.current.clear()
+    latestCompletedTurnRef.current = null
+    latestSpeechSequenceRef.current = 0
+    latestAssistantItemRef.current = null
+    finishedSpeechIdsRef.current.clear()
+    interruptedItemIdsRef.current.clear()
     setDiagnosticTimeline([])
     setSessionDiagnosticError('')
     setMicrophoneLevel(null)
@@ -346,8 +484,11 @@ function App() {
       setRemoteParticipantCount(room.remoteParticipants.size)
     }
     const microphonePublicationChanged = () => roomRef.current === room && syncMicrophoneState(room)
-    const trackSubscribed = (track: RemoteTrack) => attachRemoteAudio(room, track)
+    const trackSubscribed = (track: RemoteTrack) => {
+      if (roomRef.current === room) attachRemoteAudio(room, track)
+    }
     const trackUnsubscribed = (track: RemoteTrack) => {
+      if (roomRef.current !== room) return
       track.detach()
       if (track.sid) removeRemoteAudio(room, track.sid)
     }
@@ -369,6 +510,7 @@ function App() {
       }
     }
     const audioPlaybackStatusChanged = (playing: boolean) => {
+      if (roomRef.current !== room) return
       audioPlaybackErrorRef.current = playing ? '' : 'Browser autoplay policy blocked remote audio playback.'
       updateAudioPlayback(room)
     }
@@ -377,39 +519,153 @@ function App() {
       try {
         const message = JSON.parse(new TextDecoder().decode(payload)) as unknown
         if (!isDiagnostic(message)) return
+        if (!belongsToSession(message.session_id, roomName)) return
         if (message.type === 'user_state_changed' && typeof message.state === 'string') {
           setUserActivity(message.state)
-          addDiagnosticTimelineEvent(`User is ${message.state}`)
+          if (message.state === 'speaking') {
+            setCurrentTurnDiagnostics({
+              speechSpan: null,
+              speechEndToTurnDecision: null,
+              speechEndToFinalTranscript: null,
+              turnCommitToAgentThinking: null,
+            })
+            addDiagnosticTimelineEvent('USER_SPEECH_STARTED', 'User speech started', message)
+          } else if (message.state === 'listening') {
+            addDiagnosticTimelineEvent('USER_SPEECH_ENDED', 'User speech ended (VAD activity only)', message)
+          } else {
+            addDiagnosticTimelineEvent('USER_STATE_CHANGED', `User is ${message.state}`, message)
+          }
         } else if (message.type === 'agent_state_changed' && typeof message.state === 'string') {
           setAgentActivity(message.state)
-          addDiagnosticTimelineEvent(`Agent is ${message.state}`)
+          const userSpeechToAgentStopped = readNonNegativeNumber(message.user_speech_to_agent_stopped_seconds)
+          if (userSpeechToAgentStopped !== null) {
+            setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, userSpeechToAgentStopped }))
+          }
+          if (message.state === 'thinking') {
+            const turnCommitToAgentThinking = readNonNegativeNumber(message.turn_commit_to_agent_thinking_seconds)
+            if (turnCommitToAgentThinking !== null) {
+              setCurrentTurnDiagnostics((diagnostics) => ({ ...diagnostics, turnCommitToAgentThinking }))
+            }
+            addDiagnosticTimelineEvent('AGENT_THINKING', 'Agent started processing', message)
+          } else if (message.state === 'speaking') {
+            addDiagnosticTimelineEvent('AGENT_SPEAKING', 'Agent started speaking', message)
+          } else {
+            addDiagnosticTimelineEvent('AGENT_STATE_CHANGED', `Agent is ${message.state}`, message,
+              userSpeechToAgentStopped === null ? undefined : `User speech → agent stopped speaking (worker): ${formatMilliseconds(userSpeechToAgentStopped)}`)
+          }
         } else if (message.type === 'conversation_item_added' && typeof message.role === 'string') {
-          const itemId = typeof message.item_id === 'string' ? message.item_id : null
-          if (message.role === 'assistant' && message.interrupted === true) {
-            addDiagnosticTimelineEvent('Assistant response interrupted')
-          } else if (message.role === 'assistant' && typeof message.text === 'string') {
-            setAgentResponse(message.text)
-            latestAssistantItemIdRef.current = itemId
-            if (itemId) {
-              const pendingLatency = pendingTurnLatenciesRef.current.get(itemId)
-              if (pendingLatency) {
-                pendingTurnLatenciesRef.current.delete(itemId)
-                setTurnLatency(pendingLatency)
+          if (message.role === 'assistant') {
+            const sequence = readNonNegativeNumber(message.turn_sequence)
+            if (typeof message.item_id === 'string' && typeof message.speech_id === 'string' && sequence !== null) {
+              const incoming: AssistantItem = {
+                itemId: message.item_id,
+                speechId: message.speech_id,
+                sequence,
+                text: typeof message.text === 'string' ? message.text : '',
+                interrupted: message.interrupted === true,
+              }
+              if (incoming.interrupted && !interruptedItemIdsRef.current.has(incoming.itemId)) {
+                interruptedItemIdsRef.current.add(incoming.itemId)
+                setInterruptedResponseCount(interruptedItemIdsRef.current.size)
+              }
+              const selected = selectAssistantItem(latestAssistantItemRef.current, incoming, latestSpeechSequenceRef.current)
+              const applied = selected === incoming
+              if (applied) {
+                latestSpeechSequenceRef.current = Math.max(latestSpeechSequenceRef.current, sequence)
+                latestAssistantItemRef.current = incoming
+                setAgentResponse(incoming.interrupted ? '' : incoming.text)
+                setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, assistantResponse: incoming.interrupted ? 'Interrupted' : 'Completed' }))
+              }
+              addDiagnosticTimelineEvent(
+                incoming.interrupted ? 'ASSISTANT_RESPONSE_INTERRUPTED' : 'ASSISTANT_RESPONSE_COMPLETED',
+                `Turn ${sequence} assistant item ${applied ? 'applied' : 'observed after newer speech'}`,
+                message,
+                `Speech ${incoming.speechId} · item ${incoming.itemId}`,
+              )
+            }
+          } else if (message.role === 'user') {
+            const speechSpan = readNonNegativeNumber(message.speech_span_seconds)
+            const speechEndToTurnDecision = readNonNegativeNumber(message.speech_end_to_turn_decision_seconds)
+            const speechEndToFinalTranscript = readNonNegativeNumber(message.speech_end_to_final_transcript_seconds)
+            setCurrentTurnDiagnostics((diagnostics) => ({
+              ...diagnostics,
+              speechSpan,
+              speechEndToTurnDecision,
+              speechEndToFinalTranscript,
+            }))
+            addDiagnosticTimelineEvent(
+              'USER_TURN_COMMITTED',
+              'User conversation item committed and available to the agent',
+              message,
+              `Item ${typeof message.item_id === 'string' ? message.item_id : 'unknown'}${speechEndToTurnDecision === null ? '' : ` · end-of-turn decision ${formatMilliseconds(speechEndToTurnDecision)}`}`,
+            )
+          } else {
+            addDiagnosticTimelineEvent('CONVERSATION_ITEM_COMMITTED', `Committed ${message.role} conversation item`, message)
+          }
+        } else if (message.type === 'overlapping_speech' && typeof message.is_interruption === 'boolean') {
+          const result = message.agent_ended === true ? 'Inconclusive (agent ended)' : message.is_interruption ? 'Interruption' : 'Backchannel'
+          const detectionDelay = readNonNegativeNumber(message.detection_delay_seconds)
+          const predictionDuration = readNonNegativeNumber(message.prediction_duration_seconds)
+          const totalDuration = readNonNegativeNumber(message.total_duration_seconds)
+          const probability = readNonNegativeNumber(message.probability)
+          const requestCount = readNonNegativeNumber(message.num_requests)
+          setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, overlap: result, detectionDelay, predictionDuration, totalDuration, probability, requestCount }))
+          addDiagnosticTimelineEvent('OVERLAPPING_SPEECH', `LiveKit classified overlap: ${result.toLowerCase()}`, message,
+            `Detection ${formatMilliseconds(detectionDelay)} · prediction ${formatMilliseconds(predictionDuration)} · RTT ${formatMilliseconds(totalDuration)}${requestCount === null ? '' : ` · ${requestCount} requests`}`)
+        } else if (message.type === 'agent_false_interruption' && typeof message.resumed === 'boolean') {
+          setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, falseInterruptionResumed: message.resumed ? 'Yes' : 'No' }))
+          addDiagnosticTimelineEvent('AGENT_FALSE_INTERRUPTION', 'LiveKit detected a false interruption', message,
+            `Speech resumed automatically: ${message.resumed ? 'yes' : 'no'}`)
+        } else if (message.type === 'speech_created' && typeof message.speech_id === 'string') {
+          const sequence = readNonNegativeNumber(message.turn_sequence)
+          if (sequence !== null) {
+            if (sequence > latestSpeechSequenceRef.current) {
+              latestSpeechSequenceRef.current = sequence
+              if (!finishedSpeechIdsRef.current.has(message.speech_id)) {
+                setActiveSpeechId(message.speech_id)
+                setAgentResponse('')
+                setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, assistantResponse: 'In progress' }))
               }
             }
-            addDiagnosticTimelineEvent('Committed assistant conversation item')
-          } else {
-            addDiagnosticTimelineEvent(`Committed ${message.role} conversation item`)
+            addDiagnosticTimelineEvent('SPEECH_CREATED', `Turn ${sequence} response created`, message, `Speech ${message.speech_id}`)
+          }
+        } else if (message.type === 'speech_finished' && typeof message.speech_id === 'string') {
+          const sequence = readNonNegativeNumber(message.turn_sequence)
+          if (sequence !== null) {
+            finishedSpeechIdsRef.current.add(message.speech_id)
+            latestSpeechSequenceRef.current = Math.max(latestSpeechSequenceRef.current, sequence)
+            if (sequence === latestSpeechSequenceRef.current) setActiveSpeechId(null)
+            addDiagnosticTimelineEvent('SPEECH_FINISHED', `Turn ${sequence} ${message.interrupted === true ? 'interrupted' : 'finished'}`, message,
+              `Speech ${message.speech_id}${typeof message.item_id === 'string' ? ` · item ${message.item_id}` : ''}`)
           }
         } else if (message.type === 'turn_metrics' && typeof message.item_id === 'string') {
-          const latency = readTurnLatency(message)
-          if (!latency) return
-          if (latestAssistantItemIdRef.current === message.item_id) {
-            setTurnLatency(latency)
-          } else {
-            pendingTurnLatenciesRef.current.set(message.item_id, latency)
+          const itemId = message.item_id
+          const turnSequence = readNonNegativeNumber(message.turn_sequence)
+          if (turnSequence !== null) {
+            const result = mergeTurnMetrics(completedTurnLatenciesRef.current, latestCompletedTurnRef.current,
+              itemId, turnSequence, message.completed === true, readTurnLatency(message) ?? {})
+            latestCompletedTurnRef.current = result.latestCompleted
+            if (result.visibleLatency) setTurnLatency(result.visibleLatency)
           }
-          addDiagnosticTimelineEvent('Completed response latency received')
+
+          const speechId = typeof message.speech_id === 'string' ? message.speech_id : 'unknown speech'
+          addDiagnosticTimelineEvent(
+            turnSequence !== null && turnSequence < latestSpeechSequenceRef.current ? 'LATE_RESPONSE_METRIC' : 'RESPONSE_METRICS_RECEIVED',
+            `Turn ${turnSequence ?? 'unknown'} metrics updated (${speechId})`,
+            message,
+          )
+        } else if (message.type === 'provider_metric') {
+          const providerMetric = readLatestProviderMetric(message)
+          if (providerMetric) setLatestProviderMetric(providerMetric)
+        } else if (message.type === 'speech_provider_metric' && typeof message.speech_id === 'string') {
+          const sequence = readNonNegativeNumber(message.turn_sequence)
+          const providerMetric = readLatestProviderMetric(message)
+          addDiagnosticTimelineEvent(
+            sequence !== null && sequence < latestSpeechSequenceRef.current ? 'LATE_PROVIDER_METRIC' : 'INTERRUPTED_PROVIDER_METRIC',
+            `Turn ${sequence ?? 'unknown'} ${message.metric_type === 'tts' ? 'TTS' : 'LLM'} metric observed after interruption/newer speech`,
+            message,
+            `Speech ${message.speech_id}${providerMetric ? ` · ${providerMetric.values}` : ''}`,
+          )
         } else if (message.type === 'session_usage' && Array.isArray(message.items)) {
           setUsage(message.items.map((item) => {
             const values = item as Record<string, unknown>
@@ -417,13 +673,18 @@ function App() {
           }).join(' · ') || 'No provider usage yet')
         } else if (message.type === 'session_started' && typeof message.llm_model === 'string') {
           setLlmModel(message.llm_model)
+          setTurnConfiguration(readTurnConfiguration(message.turn_configuration))
+          const configuration = message.turn_configuration
+          if (typeof configuration === 'object' && configuration !== null && 'interruption_mode' in configuration && typeof configuration.interruption_mode === 'string') {
+            setInterruptionMode(`${configuration.interruption_mode} (configured)`)
+          }
           setUserActivity('listening')
           setAgentActivity('idle')
-          addDiagnosticTimelineEvent('Voice pipeline ready')
+          addDiagnosticTimelineEvent('SESSION_READY', 'Voice pipeline ready', message)
         } else if (message.type === 'session_error' && typeof message.source === 'string' && typeof message.message === 'string') {
           setSessionDiagnosticError(`${message.source}: ${sanitizeConnectionErrorMessage(message.message)}`)
-          addDiagnosticTimelineEvent(`Provider error: ${message.source}`)
-        } else if (message.type === 'session_closed') addDiagnosticTimelineEvent('Voice pipeline closed')
+          addDiagnosticTimelineEvent('SESSION_ERROR', `Provider error: ${message.source}`, message)
+        } else if (message.type === 'session_closed') addDiagnosticTimelineEvent('SESSION_CLOSED', 'Voice pipeline closed', message)
       } catch {
         // Ignore malformed data messages from the room.
       }
@@ -528,7 +789,7 @@ function App() {
 
   return (
     <div className="shell">
-      <aside className="sidebar" aria-label="Main navigation"><div className="brand"><div className="mark" aria-hidden="true"><i /><i /><i /><i /><i /></div><span>voicely<span className="brand-accent">.</span></span></div><div><p className="nav-label">Workspace</p><nav className="nav" aria-label="Sections"><a className="active" href="#session"><span>Voice session</span></a><a href="#diagnostics"><span>Diagnostics</span></a></nav></div><div className="sidebar-bottom"><div className="phase">Phase 1C</div><p>Live STT, LLM, speech, and truthful pipeline diagnostics.</p></div></aside>
+      <aside className="sidebar" aria-label="Main navigation"><div className="brand"><div className="mark" aria-hidden="true"><i /><i /><i /><i /><i /></div><span>voicely<span className="brand-accent">.</span></span></div><div><p className="nav-label">Workspace</p><nav className="nav" aria-label="Sections"><a className="active" href="#session"><span>Voice session</span></a><a href="#diagnostics"><span>Diagnostics</span></a></nav></div><div className="sidebar-bottom"><div className="phase">Phase 2B</div><p>Turn handling and interruption visibility.</p></div></aside>
       <main className="main">
         <header className="top"><h1>Voice Companion / Session</h1><div className={`backend-status ${backendStatus === 'Backend connected' ? 'is-ready' : ''}`}><span>{backendStatus}</span><button type="button" onClick={() => setRetryAttempt((attempt) => attempt + 1)}>Retry</button></div></header>
         <div className="layout"><div className="column">
@@ -543,12 +804,112 @@ function App() {
               <div className="metric"><small>TTS generation</small><strong>{formatMilliseconds(turnLatency?.ttsDuration ?? null)}</strong></div>
               <div className="metric"><small>Speech end → agent audio (server)</small><strong>{formatMilliseconds(turnLatency?.speechEndToAgentAudio ?? null)}</strong></div>
             </div>
+            <div className="diagnostic-subsection">
+              <div className="panel-head compact"><h3>Current user turn</h3><span>Native turn signals</span></div>
+              <div className="metrics turn-metrics">
+                <div className="metric"><small>Speech span (first start to final end)</small><strong>{formatMilliseconds(currentTurnDiagnostics.speechSpan)}</strong></div>
+                <div className="metric"><small>Speech end to end-of-turn decision</small><strong>{formatMilliseconds(currentTurnDiagnostics.speechEndToTurnDecision)}</strong></div>
+                <div className="metric"><small>Speech end to final transcript</small><strong>{formatMilliseconds(currentTurnDiagnostics.speechEndToFinalTranscript)}</strong></div>
+                <div className="metric"><small>Turn commit to agent thinking</small><strong>{formatMilliseconds(currentTurnDiagnostics.turnCommitToAgentThinking)}</strong></div>
+              </div>
+            </div>
+            <div className="diagnostic-subsection">
+              <div className="panel-head compact"><h3>Turn handling</h3><span>Worker configuration</span></div>
+              <div className="connection-details turn-configuration">
+                <span>VAD <strong>{turnConfiguration?.vad ?? 'Unavailable'}</strong></span>
+                <span>VAD min silence <strong>{formatMilliseconds(turnConfiguration?.vadMinSilence ?? null)} configured</strong></span>
+                <span>Turn detection <strong>{turnConfiguration?.turnDetection ?? 'Unavailable'}</strong></span>
+                <span>Turn detector model <strong>{turnConfiguration?.turnDetectionModel ?? 'Unavailable'}</strong></span>
+                <span>Endpointing mode <strong>{turnConfiguration ? `${turnConfiguration.endpointingMode} (${turnConfiguration.endpointingModeSource})` : 'Unavailable'}</strong></span>
+                <span>Min endpoint delay <strong>{turnConfiguration ? `${formatMilliseconds(turnConfiguration.minEndpointingDelay)} ${turnConfiguration.minEndpointingDelaySource}` : 'Unavailable'}</strong></span>
+                <span>Max endpoint delay <strong>{turnConfiguration ? `${formatMilliseconds(turnConfiguration.maxEndpointingDelay)} ${turnConfiguration.maxEndpointingDelaySource}` : 'Unavailable'}</strong></span>
+                <span>Preemptive generation <strong>{turnConfiguration ? (turnConfiguration.preemptiveGenerationEnabled ? 'enabled' : 'disabled') : 'Unavailable'}</strong></span>
+              </div>
+            </div>
+            <div className="diagnostic-subsection">
+              <div className="panel-head compact"><h3>Interruption</h3><span>Native LiveKit events</span></div>
+              <div className="connection-details turn-configuration">
+                <span>Interruption mode <strong>{interruptionMode}</strong></span>
+                <span>Last overlap <strong>{interruptionDiagnostics.overlap}</strong></span>
+                <span>Detection delay <strong>{formatMilliseconds(interruptionDiagnostics.detectionDelay)}</strong></span>
+                <span>Prediction duration <strong>{formatMilliseconds(interruptionDiagnostics.predictionDuration)}</strong></span>
+                <span>Detector RTT <strong>{formatMilliseconds(interruptionDiagnostics.totalDuration)}</strong></span>
+                <span>Probability <strong>{interruptionDiagnostics.probability === null ? '—' : `${(interruptionDiagnostics.probability * 100).toFixed(0)}%`}</strong></span>
+                <span>Detector requests <strong>{interruptionDiagnostics.requestCount ?? '—'}</strong></span>
+                <span>Last assistant response <strong>{interruptionDiagnostics.assistantResponse}</strong></span>
+                <span>False interruption resumed <strong>{interruptionDiagnostics.falseInterruptionResumed}</strong></span>
+                <span>User speech → agent stopped speaking (worker) <strong>{formatMilliseconds(interruptionDiagnostics.userSpeechToAgentStopped)}</strong></span>
+              </div>
+            </div>
+            <div className="diagnostic-subsection">
+              <div className="panel-head compact"><h3>Response ownership</h3><span>Current room</span></div>
+              <div className="connection-details turn-configuration">
+                <span>Session <strong>{roomName || 'None'}</strong></span>
+                <span>Active response speech <strong>{activeSpeechId || 'None'}</strong></span>
+                <span>Latest assistant item <strong>{latestAssistantItemRef.current?.itemId || 'None'}</strong></span>
+                <span>Interrupted assistant items <strong>{interruptedResponseCount}</strong></span>
+              </div>
+            </div>
+            <div className="connection-details">
+              <span>Latest provider metric (uncorrelated) <strong>{latestProviderMetric ? `${latestProviderMetric.metricType}: ${latestProviderMetric.values}${latestProviderMetric.speechId ? ` · speech ${latestProviderMetric.speechId}` : ''}` : 'None'}</strong></span>
+            </div>
             <div className="connection-details"><span>LLM model <strong>{llmModel}</strong></span><span>Audio playback <strong>{audioPlayback.status}</strong></span><span>Room <strong>{roomName || 'Not connected'}</strong></span><span>Local participant <strong>{participantIdentity || 'Not available'}</strong></span><span>Remote participants <strong>{connectionStatus === 'Connected' ? remoteParticipantCount : '-'}</strong></span><span>Session usage <strong>{usage}</strong></span>{audioPlayback.error && <span>Playback error <strong>{audioPlayback.error}</strong></span>}</div>
           </section>
         </div><div className="column">
-          <section className="card conversation" aria-labelledby="conversation-heading"><div className="panel-head"><h3 id="conversation-heading">Conversation</h3><span>{agentActivity}</span></div><div className="conversation-debug"><div className="debug-row"><small>User activity</small><strong className={`activity ${userActivity}`}>{userActivity}</strong></div><div className="debug-row"><small>Agent activity</small><strong className={`activity ${agentActivity}`}>{agentActivity}</strong></div><div className="debug-block"><small>Microphone signal</small><p>{microphoneLevel === null ? 'Enable the microphone to inspect its local input level.' : microphoneStatus === 'Muted' ? 'Muted' : `Local input level: ${microphoneLevel.toFixed(3)}`}</p></div><div className="debug-block"><small>Current partial user transcript</small><p>{partialTranscript || 'Waiting for speech recognition...'}</p></div><div className="debug-block"><small>Committed user turns</small>{finalTranscripts.length ? <ol className="transcript-history">{finalTranscripts.map((transcript) => <li key={transcript.id}>{transcript.text}</li>)}</ol> : <p>No committed user turn yet.</p>}</div><div className="debug-block"><small>Generated agent response</small><p>{agentResponse || 'Waiting for a committed agent response...'}</p></div><div className="debug-block"><small>Speech-synchronized agent text</small><p>{agentSpeechText || 'Waiting for agent audio...'}</p></div><div className="debug-block"><small>Pipeline event timeline</small>{diagnosticTimeline.length ? <ol className="diagnostic-timeline">{diagnosticTimeline.map((event) => <li key={event.id}>{event.message}</li>)}</ol> : <p>No session events yet.</p>}</div></div></section>
+          <section className="card conversation" aria-labelledby="conversation-heading">
+            <div className="panel-head"><h3 id="conversation-heading">Conversation</h3><span>{agentActivity}</span></div>
+            <div className="conversation-debug">
+              <div className="debug-row"><small>User activity</small><strong className={`activity ${userActivity}`}>{userActivity}</strong></div>
+              <div className="debug-row"><small>Agent activity</small><strong className={`activity ${agentActivity}`}>{agentActivity}</strong></div>
+              <div className="debug-block"><small>Microphone signal</small><p>{microphoneLevel === null ? 'Enable the microphone to inspect its local input level.' : microphoneStatus === 'Muted' ? 'Muted' : `Local input level: ${microphoneLevel.toFixed(3)}`}</p></div>
+              <div className="debug-block"><small>Current partial user transcript</small><p>{partialTranscript || 'Waiting for speech recognition...'}</p></div>
+              <div className="debug-block"><small>Final user transcriptions</small>{finalTranscripts.length ? <ol className="transcript-history">{finalTranscripts.map((transcript) => <li key={transcript.id}>{transcript.text}</li>)}</ol> : <p>No final user transcription yet.</p>}</div>
+              <div className="debug-block"><small>Generated agent response</small><p>{agentResponse || 'Waiting for a committed agent response...'}</p></div>
+              <div className="debug-block"><small>Speech-synchronized agent text</small><p>{agentSpeechText || 'Waiting for agent audio...'}</p></div>
+              <div className="debug-block">
+                <small>Checkpoint 2A manual prompts</small>
+                <ul className="test-prompts">
+                  <li>
+                    <strong>Test A — clearly complete:</strong> Say “What is Redis?” Record end-of-turn delay, speech end → agent audio, and LLM TTFT. Does the detector close the completed utterance efficiently?
+                  </li>
+                  <li>
+                    <strong>Test B — short hesitation:</strong> Say “I've been thinking that...”, pause approximately 1 second, then say “...I should change my project.” Observe whether USER_TURN_COMMITTED or AGENT_THINKING occurs during the pause, or whether both phrases remain one user turn.
+                  </li>
+                  <li>
+                    <strong>Test C — long silence:</strong> Say “I don't know...” and stay silent. Record end-of-turn delay and when the turn commits; check that it waits appropriately without hanging.
+                  </li>
+                </ul>
+              </div>
+              <div className="debug-block">
+                <small>Checkpoint 2B manual scenarios</small>
+                <ul className="test-prompts">
+                  <li><strong>1. Genuine interruption:</strong> During a long response say “Wait, stop.” Check overlap verdict, agent stop, interrupted assistant item, and next user turn. Record detection delay and worker stop time.</li>
+                  <li><strong>2. Semantic correction:</strong> During agent speech say “No, that's not what I meant.” Check that the prior answer stops and the correction receives a response.</li>
+                  <li><strong>3. “OK” backchannel:</strong> During agent speech say “OK.” Record the native overlap verdict and whether speech continues.</li>
+                  <li><strong>4. “Hmm” backchannel:</strong> During agent speech say “Hmm.” Record the native overlap verdict and whether speech continues.</li>
+                  <li><strong>5. Brief noise:</strong> Make a small non-speech sound. Watch VAD state, overlap verdict, and false interruption recovery.</li>
+                </ul>
+              </div>
+              <div className="debug-block">
+                <small>Pipeline event timeline</small>
+                {diagnosticTimeline.length ? (
+                  <ol className="diagnostic-timeline">
+                    {diagnosticTimeline.map((event) => (
+                      <li key={event.id}>
+                        <time>{event.timestamp}</time>
+                        <code>{event.type}</code>
+                        <span>{event.message}</span>
+                        {event.sessionElapsedSeconds !== null && <em>+{event.sessionElapsedSeconds.toFixed(3)} s worker time</em>}
+                        {event.details && <em>{event.details}</em>}
+                      </li>
+                    ))}
+                  </ol>
+                ) : <p>No session events yet.</p>}
+              </div>
+            </div>
+          </section>
         </div></div>
-        <p className="footer">Voice Companion · Phase 1C uses real LiveKit room audio, native transcriptions, per-turn latency, and session usage. TTS timing is not browser-audible playback timing.</p>
+        <p className="footer">Voice Companion · Phase 2B exposes native turn and interruption signals. Worker timing is not browser-audible playback timing.</p>
       </main>
     </div>
   )
