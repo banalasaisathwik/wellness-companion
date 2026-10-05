@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+﻿import { useEffect, useRef, useState } from 'react'
 import {
   ConnectionState,
-  createAudioAnalyser,
   type Participant,
   type RemoteTrack,
   type RemoteTrackPublication,
@@ -10,205 +9,138 @@ import {
   Track,
   type TranscriptionSegment,
 } from 'livekit-client'
-import { belongsToSession, mergeTurnMetrics, selectAssistantItem, type AssistantItem, type TurnLatency } from './reliability'
+import { updateTranscript, type ConversationMessage } from './conversation'
+import { belongsToSession, mergeTurnMetrics, selectAssistantItem, slowestStage, updateRecentTurns, type AssistantItem, type CompletedTurn, type TurnLatency } from './reliability'
 import './App.css'
+import './Luna.css'
 
-type Transcript = { id: string; text: string }
-type TimelineEvent = {
-  id: number
-  type: string
-  timestamp: string
-  sessionElapsedSeconds: number | null
-  message: string
-  details?: string
-}
-type AudioPlaybackState = {
-  status: string
-  error: string
-}
-type CurrentTurnDiagnostics = {
-  speechSpan: number | null
-  speechEndToTurnDecision: number | null
-  speechEndToFinalTranscript: number | null
-  turnCommitToAgentThinking: number | null
-}
-type TurnConfiguration = {
-  vad: string
-  vadMinSilence: number | null
-  turnDetection: string
-  turnDetectionModel: string
-  endpointingMode: string
-  endpointingModeSource: string
-  minEndpointingDelay: number | null
-  minEndpointingDelaySource: string
-  maxEndpointingDelay: number | null
-  maxEndpointingDelaySource: string
-  preemptiveGenerationEnabled: boolean
-}
-type LatestProviderMetric = {
-  metricType: string
-  speechId: string | null
-  values: string
-}
-type InterruptionDiagnostics = {
-  overlap: string
-  detectionDelay: number | null
-  predictionDuration: number | null
-  totalDuration: number | null
-  probability: number | null
-  requestCount: number | null
-  assistantResponse: string
-  falseInterruptionResumed: string
-  userSpeechToAgentStopped: number | null
-}
-const emptyInterruptionDiagnostics: InterruptionDiagnostics = {
-  overlap: 'Unavailable',
-  detectionDelay: null,
-  predictionDuration: null,
-  totalDuration: null,
-  probability: null,
-  requestCount: null,
-  assistantResponse: 'Unavailable',
-  falseInterruptionResumed: 'Unavailable',
-  userSpeechToAgentStopped: null,
+type TimelineEvent = { id: number; time: string; text: string }
+type Interruption = { speechId: string; sequence: number; seconds: number }
+type ConversationState = { energy: string; stress: string; frustration: string; sentiment: string }
+type SessionCredentials = { server_url: string; token: string; room_name: string }
+
+const unknownState: ConversationState = {
+  energy: 'UNKNOWN', stress: 'UNKNOWN', frustration: 'UNKNOWN', sentiment: 'UNKNOWN',
 }
 
-function isDiagnostic(message: unknown): message is Record<string, unknown> & { type: string } {
-  return typeof message === 'object' && message !== null && typeof (message as Record<string, unknown>).type === 'string'
+const strategyDetails: Record<string, { title: string; description: string }> = {
+  LISTEN: { title: 'Listening', description: 'Make room for what you want to share.' },
+  CLARIFY: { title: 'Clarifying', description: 'Understand what matters most right now.' },
+  ENCOURAGE: { title: 'Encouragement', description: 'Offer steady, practical support.' },
+  GROUND: { title: 'Grounding', description: 'Slow the conversation and return to the present.' },
+  PROBLEM_SOLVE: { title: 'Problem solving', description: 'Work through a next step together.' },
+  CHECK_IN: { title: 'Checking in', description: 'Pause and see how this feels for you.' },
 }
 
-function formatMilliseconds(value: number | null) {
-  return value === null ? '—' : `${(value * 1000).toFixed(0)} ms`
-}
-
-function readNonNegativeNumber(value: unknown) {
+function readSeconds(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
 }
 
-function formatClockTimestamp(date: Date) {
-  return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}.${date.getMilliseconds().toString().padStart(3, '0')}`
+function formatMilliseconds(value: number | null) {
+  return value === null ? '—' : value > 0 && value < 0.001 ? '<1 ms' : `${Math.round(value * 1000)} ms`
 }
 
-function readTurnConfiguration(value: unknown): TurnConfiguration | null {
-  if (typeof value !== 'object' || value === null) return null
-  const configuration = value as Record<string, unknown>
-  if (
-    typeof configuration.vad !== 'string'
-    || typeof configuration.turn_detection !== 'string'
-    || typeof configuration.turn_detection_model !== 'string'
-    || typeof configuration.endpointing_mode !== 'string'
-    || typeof configuration.preemptive_generation_enabled !== 'boolean'
-  ) return null
-
-  return {
-    vad: configuration.vad,
-    vadMinSilence: readNonNegativeNumber(configuration.vad_min_silence_seconds),
-    turnDetection: configuration.turn_detection,
-    turnDetectionModel: configuration.turn_detection_model,
-    endpointingMode: configuration.endpointing_mode,
-    endpointingModeSource: typeof configuration.endpointing_mode_source === 'string' ? configuration.endpointing_mode_source : 'unknown',
-    minEndpointingDelay: readNonNegativeNumber(configuration.min_endpointing_delay_seconds),
-    minEndpointingDelaySource: typeof configuration.min_endpointing_delay_source === 'string' ? configuration.min_endpointing_delay_source : 'unknown',
-    maxEndpointingDelay: readNonNegativeNumber(configuration.max_endpointing_delay_seconds),
-    maxEndpointingDelaySource: typeof configuration.max_endpointing_delay_source === 'string' ? configuration.max_endpointing_delay_source : 'unknown',
-    preemptiveGenerationEnabled: configuration.preemptive_generation_enabled,
-  }
-}
-
-function readTurnLatency(message: Record<string, unknown>): TurnLatency | null {
-  const latency: TurnLatency = {}
-  const fields = [
+function readTurnLatency(message: Record<string, unknown>): TurnLatency {
+  const values: TurnLatency = {}
+  for (const [source, target] of [
+    ['response_latency_seconds', 'responseLatency'],
+    ['final_transcript_seconds', 'finalTranscript'],
+    ['turn_detection_seconds', 'turnDetection'],
+    ['turn_processing_seconds', 'turnProcessing'],
     ['llm_first_token_seconds', 'llmFirstToken'],
-    ['llm_duration_seconds', 'llmDuration'],
+    ['first_speakable_text_seconds', 'firstSpeakableText'],
     ['tts_first_audio_seconds', 'ttsFirstAudio'],
-    ['tts_duration_seconds', 'ttsDuration'],
-    ['speech_end_to_agent_audio_seconds', 'speechEndToAgentAudio'],
-  ] as const
-
-  for (const [source, target] of fields) {
-    const value = readNonNegativeNumber(message[source])
-    if (value !== null) latency[target] = value
+    ['audio_output_start_seconds', 'audioOutputStart'],
+    ['state_analysis_seconds', 'stateAnalysis'],
+    ['strategy_selection_seconds', 'strategySelection'],
+  ] as const) {
+    const value = readSeconds(message[source])
+    if (value !== null) values[target] = value
   }
-  return Object.keys(latency).length ? latency : null
+  if (values.responseLatency !== undefined
+    && (message.response_latency_source === 'native' || message.response_latency_source === 'worker_state_fallback')) {
+    values.responseSource = message.response_latency_source
+  }
+  if (message.llm_first_token_source === 'native' || message.llm_first_token_source === 'provider') {
+    values.llmFirstTokenSource = message.llm_first_token_source
+  }
+  if (message.tts_first_audio_source === 'native' || message.tts_first_audio_source === 'provider') {
+    values.ttsFirstAudioSource = message.tts_first_audio_source
+  }
+  if (Array.isArray(message.provider_request_ids)) {
+    values.providerRequestIds = message.provider_request_ids.filter((value): value is string => typeof value === 'string').slice(0, 8)
+  }
+  return values
 }
 
-function readLatestProviderMetric(message: Record<string, unknown>): LatestProviderMetric | null {
-  if (typeof message.metric_type !== 'string') return null
-  const values = [
-    ['llm_duration_seconds', 'LLM duration'],
-    ['tts_duration_seconds', 'TTS duration'],
-    ['llm_first_token_seconds', 'LLM first token'],
-    ['tts_first_audio_seconds', 'TTS first audio'],
-  ]
-    .flatMap(([key, label]) => {
-      const value = readNonNegativeNumber(message[key])
-      return value === null ? [] : [`${label} ${formatMilliseconds(value)}`]
-    })
-  if (!values.length) return null
-  return {
-    metricType: message.metric_type,
-    speechId: typeof message.speech_id === 'string' ? message.speech_id : null,
-    values: values.join(', '),
+function readConversationState(value: unknown): ConversationState | null {
+  if (!value || typeof value !== 'object') return null
+  const state = value as Record<string, unknown>
+  const allowed: Record<keyof ConversationState, string[]> = {
+    energy: ['LOW', 'MEDIUM', 'HIGH', 'UNKNOWN'],
+    stress: ['LOW', 'MEDIUM', 'HIGH', 'UNKNOWN'],
+    frustration: ['LOW', 'MEDIUM', 'HIGH', 'UNKNOWN'],
+    sentiment: ['NEGATIVE', 'NEUTRAL', 'POSITIVE', 'UNKNOWN'],
   }
+  if ((Object.keys(allowed) as (keyof ConversationState)[]).some((key) => !allowed[key].includes(state[key] as string))) return null
+  return state as ConversationState
+}
+
+function sanitizeError(message: string) {
+  return message
+    .replace(/\b(?:wss?|https?):\/\/[^\s]+/gi, '[redacted URL]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[redacted token]')
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\b((?:token|api[ _-]?secret)\s*[=:]\s*)\S+/gi, '$1[redacted]')
 }
 
 function App() {
   const [backendStatus, setBackendStatus] = useState('Checking backend...')
   const [retryAttempt, setRetryAttempt] = useState(0)
   const [sessionStatus, setSessionStatus] = useState('No session created')
-  const [serverUrl, setServerUrl] = useState('')
-  const [token, setToken] = useState('')
+  const [startingStep, setStartingStep] = useState('')
   const [roomName, setRoomName] = useState('')
-  const [participantIdentity, setParticipantIdentity] = useState('')
   const [connectionStatus, setConnectionStatus] = useState('Disconnected')
   const [connectionError, setConnectionError] = useState('')
   const [microphoneStatus, setMicrophoneStatus] = useState('Microphone off')
   const [microphoneError, setMicrophoneError] = useState('')
-  const [remoteParticipantCount, setRemoteParticipantCount] = useState(0)
-  const [partialTranscript, setPartialTranscript] = useState('')
-  const [finalTranscripts, setFinalTranscripts] = useState<Transcript[]>([])
-  const [agentResponse, setAgentResponse] = useState('')
-  const [agentSpeechText, setAgentSpeechText] = useState('')
-  const [userActivity, setUserActivity] = useState('Waiting for session')
-  const [agentActivity, setAgentActivity] = useState('Waiting for session')
-  const [llmModel, setLlmModel] = useState('Unavailable')
-  const [turnLatency, setTurnLatency] = useState<TurnLatency | null>(null)
-  const [activeSpeechId, setActiveSpeechId] = useState<string | null>(null)
-  const [interruptedResponseCount, setInterruptedResponseCount] = useState(0)
-  const [latestProviderMetric, setLatestProviderMetric] = useState<LatestProviderMetric | null>(null)
-  const [currentTurnDiagnostics, setCurrentTurnDiagnostics] = useState<CurrentTurnDiagnostics>({
-    speechSpan: null,
-    speechEndToTurnDecision: null,
-    speechEndToFinalTranscript: null,
-    turnCommitToAgentThinking: null,
-  })
-  const [turnConfiguration, setTurnConfiguration] = useState<TurnConfiguration | null>(null)
-  const [interruptionMode, setInterruptionMode] = useState('Unavailable')
-  const [interruptionDiagnostics, setInterruptionDiagnostics] = useState<InterruptionDiagnostics>(emptyInterruptionDiagnostics)
-  const [usage, setUsage] = useState('Unavailable')
-  const [audioPlayback, setAudioPlayback] = useState<AudioPlaybackState>({
-    status: 'Remote audio track unavailable',
-    error: '',
-  })
-  const [microphoneLevel, setMicrophoneLevel] = useState<number | null>(null)
-  const [diagnosticTimeline, setDiagnosticTimeline] = useState<TimelineEvent[]>([])
-  const [sessionDiagnosticError, setSessionDiagnosticError] = useState('')
+  const [sessionError, setSessionError] = useState('')
+  const [audioPlayback, setAudioPlayback] = useState('Remote audio unavailable')
+  const [userActivity, setUserActivity] = useState('waiting')
+  const [agentActivity, setAgentActivity] = useState('waiting')
+  const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([])
+  const [conversationState, setConversationState] = useState<ConversationState>(unknownState)
+  const [stateConfidence, setStateConfidence] = useState<number | null>(null)
+  const [strategy, setStrategy] = useState('Waiting for a turn')
+  const [stateStatus, setStateStatus] = useState('Waiting for a turn')
+  const [recentTurns, setRecentTurns] = useState<CompletedTurn[]>([])
+  const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null)
+  const [interruptions, setInterruptions] = useState<Interruption[]>([])
+  const [providerModels, setProviderModels] = useState({ stt: '', llm: '', tts: '' })
+  const [timeline, setTimeline] = useState<TimelineEvent[]>([])
+  const [debugOpen, setDebugOpen] = useState(false)
+
   const roomRef = useRef<Room | null>(null)
+  const startingRef = useRef(false)
+  const startAttemptRef = useRef(0)
   const connectionAttemptRef = useRef<Room | null>(null)
   const microphoneRequestRoomRef = useRef<Room | null>(null)
   const audioContainerRef = useRef<HTMLDivElement | null>(null)
   const remoteAudioElementsRef = useRef(new Map<string, HTMLMediaElement>())
   const audioPlaybackErrorRef = useRef('')
-  const finalTranscriptIdsRef = useRef(new Set<string>())
+  const userSegmentOwnersRef = useRef(new Map<string, string>())
+  const assistantSegmentOwnersRef = useRef(new Map<string, string>())
+  const assistantMessageBySpeechRef = useRef(new Map<string, string>())
+  const activeUserMessageIdRef = useRef<string | null>(null)
+  const userTurnCommittedRef = useRef(false)
+  const userSpeechActiveRef = useRef(false)
+  const activeAssistantSpeechRef = useRef<{ speechId: string; messageId: string | null } | null>(null)
   const completedTurnLatenciesRef = useRef(new Map<string, TurnLatency>())
   const latestCompletedTurnRef = useRef<{ itemId: string; sequence: number } | null>(null)
   const latestSpeechSequenceRef = useRef(0)
   const latestAssistantItemRef = useRef<AssistantItem | null>(null)
-  const finishedSpeechIdsRef = useRef(new Set<string>())
-  const interruptedItemIdsRef = useRef(new Set<string>())
+  const latestStateTurnRef = useRef<{ itemId: string; sequence: number } | null>(null)
   const timelineIdRef = useRef(0)
-  const microphoneAnalyserTimerRef = useRef<number | null>(null)
-  const microphoneAnalyserRef = useRef<ReturnType<typeof createAudioAnalyser> | null>(null)
   const roomEventHandlersRef = useRef<{
     connectionStateChanged: (state: ConnectionState) => void
     participantChanged: () => void
@@ -220,120 +152,74 @@ function App() {
     dataReceived: (payload: Uint8Array, participant?: unknown, kind?: unknown, topic?: string) => void
   } | null>(null)
 
-  const hasSessionConnectionDetails = Boolean(serverUrl && token)
   const roomIsActive = ['Connecting', 'Connected', 'Reconnecting'].includes(connectionStatus)
 
-  function sanitizeConnectionErrorMessage(message: string) {
-    return message
-      .replace(/\b(?:wss?|https?):\/\/[^\s]+/gi, '[redacted URL]')
-      .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[redacted token]')
-      .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
-      .replace(/\b((?:token|api[ _-]?secret)\s*[=:]\s*)\S+/gi, '$1[redacted]')
+  function addTimelineEvent(text: string) {
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    const id = timelineIdRef.current++
+    setTimeline((events) => [...events.slice(-29), { id, time, text }])
   }
 
-  function addDiagnosticTimelineEvent(type: string, message: string, diagnostic: Record<string, unknown>, details?: string) {
-    const event: TimelineEvent = {
-      id: timelineIdRef.current,
-      type,
-      timestamp: formatClockTimestamp(new Date()),
-      sessionElapsedSeconds: readNonNegativeNumber(diagnostic.session_elapsed_seconds),
-      message,
-      details,
-    }
-    timelineIdRef.current += 1
-    setDiagnosticTimeline((events) => [...events.slice(-29), event])
-  }
-
-  function resetConversationState() {
-    finalTranscriptIdsRef.current.clear()
-    timelineIdRef.current = 0
-    setPartialTranscript('')
-    setFinalTranscripts([])
-    setAgentResponse('')
-    setAgentSpeechText('')
-    setUserActivity('Waiting for session')
-    setAgentActivity('Waiting for session')
-    setLlmModel('Unavailable')
-    setTurnLatency(null)
-    setActiveSpeechId(null)
-    setInterruptedResponseCount(0)
-    setLatestProviderMetric(null)
-    setCurrentTurnDiagnostics({
-      speechSpan: null,
-      speechEndToTurnDecision: null,
-      speechEndToFinalTranscript: null,
-      turnCommitToAgentThinking: null,
-    })
-    setTurnConfiguration(null)
-    setInterruptionMode('Unavailable')
-    setInterruptionDiagnostics(emptyInterruptionDiagnostics)
-    setUsage('Unavailable')
-    setAudioPlayback({
-      status: 'Remote audio track unavailable',
-      error: '',
-    })
-    audioPlaybackErrorRef.current = ''
+  function resetConversation() {
+    userSegmentOwnersRef.current.clear()
+    assistantSegmentOwnersRef.current.clear()
+    assistantMessageBySpeechRef.current.clear()
+    activeUserMessageIdRef.current = null
+    userTurnCommittedRef.current = false
+    userSpeechActiveRef.current = false
+    activeAssistantSpeechRef.current = null
     completedTurnLatenciesRef.current.clear()
     latestCompletedTurnRef.current = null
     latestSpeechSequenceRef.current = 0
     latestAssistantItemRef.current = null
-    finishedSpeechIdsRef.current.clear()
-    interruptedItemIdsRef.current.clear()
-    setDiagnosticTimeline([])
-    setSessionDiagnosticError('')
-    setMicrophoneLevel(null)
-  }
-
-  function stopMicrophoneAnalyser() {
-    if (microphoneAnalyserTimerRef.current !== null) {
-      window.clearInterval(microphoneAnalyserTimerRef.current)
-      microphoneAnalyserTimerRef.current = null
-    }
-    const microphoneAnalyser = microphoneAnalyserRef.current
-    microphoneAnalyserRef.current = null
-    if (microphoneAnalyser) void microphoneAnalyser.cleanup().catch(() => undefined)
-    setMicrophoneLevel(null)
-  }
-
-  function startMicrophoneAnalyser(room: Room) {
-    stopMicrophoneAnalyser()
-    const track = room.localParticipant.getTrackPublication(Track.Source.Microphone)?.audioTrack
-    if (!track) return
-
-    try {
-      const microphoneAnalyser = createAudioAnalyser(track, {
-        fftSize: 2048,
-        smoothingTimeConstant: 0.2,
-        minDecibels: -100,
-        maxDecibels: -30,
-      })
-      microphoneAnalyserRef.current = microphoneAnalyser
-      const audioContext = microphoneAnalyser.analyser.context
-      if (audioContext instanceof AudioContext) void audioContext.resume().catch(() => undefined)
-      microphoneAnalyserTimerRef.current = window.setInterval(() => {
-        if (roomRef.current !== room || microphoneAnalyserRef.current !== microphoneAnalyser) return
-        setMicrophoneLevel(microphoneAnalyser.calculateVolume())
-      }, 250)
-    } catch {
-      microphoneAnalyserRef.current = null
-    }
+    latestStateTurnRef.current = null
+    timelineIdRef.current = 0
+    setUserActivity('waiting')
+    setAgentActivity('waiting')
+    setConversationMessages([])
+    setConversationState(unknownState)
+    setStateConfidence(null)
+    setStrategy('Waiting for a turn')
+    setStateStatus('Waiting for a turn')
+    setRecentTurns([])
+    setSelectedTurnId(null)
+    setInterruptions([])
+    setProviderModels({ stt: '', llm: '', tts: '' })
+    setTimeline([])
+    setSessionError('')
+    setAudioPlayback('Remote audio unavailable')
+    audioPlaybackErrorRef.current = ''
   }
 
   function updateAudioPlayback(room: Room) {
     const elements = [...remoteAudioElementsRef.current.values()]
-    let status = 'Remote audio track unavailable'
-    if (elements.length > 0 && audioPlaybackErrorRef.current) {
-      status = 'Playback blocked'
-    } else if (elements.some((element) => !element.paused)) {
-      status = 'Playback enabled'
-    } else if (elements.length > 0) {
-      status = room.canPlaybackAudio ? 'Audio attached' : 'Enable audio playback'
-    }
+    if (audioPlaybackErrorRef.current) setAudioPlayback(audioPlaybackErrorRef.current)
+    else if (elements.some((element) => !element.paused)) setAudioPlayback('Playing remote audio')
+    else if (elements.length) setAudioPlayback(room.canPlaybackAudio ? 'Audio attached' : 'Enable audio playback')
+    else setAudioPlayback('Remote audio unavailable')
+  }
 
-    setAudioPlayback({
-      status,
-      error: audioPlaybackErrorRef.current,
+  function attachRemoteAudio(room: Room, track: RemoteTrack) {
+    if (track.kind !== Track.Kind.Audio || !track.sid || remoteAudioElementsRef.current.has(track.sid)) return
+    const element = document.createElement('audio')
+    element.autoplay = true
+    element.muted = false
+    element.volume = 1
+    remoteAudioElementsRef.current.set(track.sid, element)
+    element.addEventListener('playing', () => {
+      audioPlaybackErrorRef.current = ''
+      if (roomRef.current === room) updateAudioPlayback(room)
     })
+    element.addEventListener('pause', () => {
+      if (roomRef.current === room) updateAudioPlayback(room)
+    })
+    element.addEventListener('error', () => {
+      audioPlaybackErrorRef.current = element.error?.message || 'Audio playback failed.'
+      if (roomRef.current === room) updateAudioPlayback(room)
+    })
+    audioContainerRef.current?.append(element)
+    track.attach(element)
+    updateAudioPlayback(room)
   }
 
   function removeRemoteAudio(room: Room, trackSid: string) {
@@ -347,31 +233,6 @@ function App() {
   function removeAllRemoteAudio() {
     for (const element of remoteAudioElementsRef.current.values()) element.remove()
     remoteAudioElementsRef.current.clear()
-  }
-
-  function attachRemoteAudio(room: Room, track: RemoteTrack) {
-    const trackSid = track.sid
-    if (track.kind !== Track.Kind.Audio || !trackSid || remoteAudioElementsRef.current.has(trackSid)) return
-    const element = document.createElement('audio')
-    element.autoplay = true
-    element.muted = false
-    element.volume = 1
-    element.dataset.trackSid = trackSid
-    remoteAudioElementsRef.current.set(trackSid, element)
-    element.addEventListener('playing', () => {
-      audioPlaybackErrorRef.current = ''
-      if (roomRef.current === room) updateAudioPlayback(room)
-    })
-    element.addEventListener('pause', () => {
-      if (roomRef.current === room) updateAudioPlayback(room)
-    })
-    element.addEventListener('error', () => {
-      audioPlaybackErrorRef.current = element.error?.message || 'The audio element reported a playback error.'
-      if (roomRef.current === room) updateAudioPlayback(room)
-    })
-    audioContainerRef.current?.append(element)
-    track.attach(element)
-    updateAudioPlayback(room)
   }
 
   function removeRoomEventListeners(room: Room) {
@@ -394,21 +255,15 @@ function App() {
 
   function syncMicrophoneState(room: Room) {
     const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone)
-    if (!publication?.track) {
-      stopMicrophoneAnalyser()
-      setMicrophoneStatus('Microphone off')
-      setMicrophoneError('')
-      return
-    }
-    setMicrophoneStatus(publication.isMuted ? 'Muted' : 'Publishing microphone')
+    setMicrophoneStatus(!publication?.track ? 'Microphone off' : publication.isMuted ? 'Muted' : 'Publishing microphone')
     setMicrophoneError('')
-    if (!microphoneAnalyserRef.current) startMicrophoneAnalyser(room)
   }
 
   function formatMicrophoneError(error: unknown) {
     if (error instanceof DOMException && error.name === 'NotAllowedError') return 'Microphone permission was denied.'
     if (error instanceof DOMException && error.name === 'NotFoundError') return 'No microphone device was found.'
-    return error instanceof Error ? error.message : 'The microphone could not be enabled.'
+    if (error instanceof Error && /permission|notallowed/i.test(error.message)) return 'Microphone permission was denied.'
+    return sanitizeError(error instanceof Error ? error.message : 'The microphone could not be enabled.')
   }
 
   useEffect(() => {
@@ -428,40 +283,52 @@ function App() {
   }, [retryAttempt])
 
   useEffect(() => () => {
+    startAttemptRef.current += 1
+    startingRef.current = false
     const room = roomRef.current
     if (room) removeRoomEventListeners(room)
     removeAllRemoteAudio()
-    stopMicrophoneAnalyser()
     roomRef.current = null
     connectionAttemptRef.current = null
     microphoneRequestRoomRef.current = null
     if (room) void room.disconnect()
   }, [])
 
-  async function createSession() {
+  useEffect(() => {
+    if (!debugOpen) return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setDebugOpen(false)
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [debugOpen])
+
+  async function createSession(): Promise<SessionCredentials | null> {
     setSessionStatus('Creating session...')
     setConnectionError('')
-    setServerUrl('')
-    setToken('')
     setRoomName('')
-    setParticipantIdentity('')
-    resetConversationState()
+    resetConversation()
     try {
       const response = await fetch('/api/session', { method: 'POST' })
       if (!response.ok) throw new Error('The session could not be created.')
-      const session = (await response.json()) as { server_url: string; token: string; room_name: string; participant_identity: string }
-      setServerUrl(session.server_url)
-      setToken(session.token)
+      const session = (await response.json()) as SessionCredentials
+      if (!session.server_url || !session.token || !session.room_name) throw new Error('Incomplete session response.')
       setRoomName(session.room_name)
-      setParticipantIdentity(session.participant_identity)
       setSessionStatus('Session created')
+      return session
     } catch {
-      setSessionStatus('Unable to create a session. Check that the backend is available and configured.')
+      setSessionStatus('Unable to create a session. Check the backend configuration.')
+      return null
     }
   }
 
-  async function connectRoom() {
-    if (roomRef.current || !serverUrl || !token) return
+  async function connectRoom(session: SessionCredentials): Promise<Room | null> {
+    if (roomRef.current) return null
     const room = new Room()
     roomRef.current = room
     connectionAttemptRef.current = room
@@ -473,15 +340,13 @@ function App() {
       if (state === ConnectionState.Connecting) setConnectionStatus('Connecting')
       if (state === ConnectionState.Connected) {
         setConnectionStatus('Connected')
-        setRemoteParticipantCount(room.remoteParticipants.size)
         syncMicrophoneState(room)
       }
       if (state === ConnectionState.Reconnecting || state === ConnectionState.SignalReconnecting) setConnectionStatus('Reconnecting')
       if (state === ConnectionState.Disconnected && connectionAttemptRef.current !== room) disconnectRoom()
     }
     const participantChanged = () => {
-      if (roomRef.current !== room) return
-      setRemoteParticipantCount(room.remoteParticipants.size)
+      if (roomRef.current === room) updateAudioPlayback(room)
     }
     const microphonePublicationChanged = () => roomRef.current === room && syncMicrophoneState(room)
     const trackSubscribed = (track: RemoteTrack) => {
@@ -496,197 +361,173 @@ function App() {
       if (roomRef.current !== room) return
       const fromUser = participant?.identity === room.localParticipant.identity
       for (const segment of segments) {
+        if (!segment.text.trim()) continue
         if (fromUser) {
-          if (segment.final) {
-            if (!finalTranscriptIdsRef.current.has(segment.id)) {
-              finalTranscriptIdsRef.current.add(segment.id)
-              setFinalTranscripts((transcripts) => [...transcripts, { id: segment.id, text: segment.text }])
-            }
-            setPartialTranscript('')
-          } else setPartialTranscript(segment.text)
+          if (!userSegmentOwnersRef.current.has(segment.id)
+            && !activeUserMessageIdRef.current && userTurnCommittedRef.current) continue
+          const messageId = userSegmentOwnersRef.current.get(segment.id)
+            ?? activeUserMessageIdRef.current ?? segment.id
+          userSegmentOwnersRef.current.set(segment.id, messageId)
+          activeUserMessageIdRef.current ??= messageId
+          setConversationMessages((messages) => updateTranscript(messages, messageId, 'user', segment))
         } else {
-          setAgentSpeechText(segment.text)
+          const activeSpeech = activeAssistantSpeechRef.current
+          const messageId = assistantSegmentOwnersRef.current.get(segment.id)
+            ?? activeSpeech?.messageId
+          if (!messageId && !activeSpeech) continue
+          const ownerId = messageId ?? segment.id
+          assistantSegmentOwnersRef.current.set(segment.id, ownerId)
+          if (activeSpeech && !activeSpeech.messageId) {
+            activeSpeech.messageId = ownerId
+            assistantMessageBySpeechRef.current.set(activeSpeech.speechId, ownerId)
+          }
+          setConversationMessages((messages) => updateTranscript(messages, ownerId, 'assistant', segment))
         }
       }
     }
     const audioPlaybackStatusChanged = (playing: boolean) => {
       if (roomRef.current !== room) return
-      audioPlaybackErrorRef.current = playing ? '' : 'Browser autoplay policy blocked remote audio playback.'
+      audioPlaybackErrorRef.current = playing ? '' : 'Browser autoplay blocked remote audio. Select Enable audio.'
       updateAudioPlayback(room)
     }
     const dataReceived = (payload: Uint8Array, _participant?: unknown, _kind?: unknown, topic?: string) => {
       if (roomRef.current !== room || topic !== 'session_diagnostics') return
       try {
-        const message = JSON.parse(new TextDecoder().decode(payload)) as unknown
-        if (!isDiagnostic(message)) return
-        if (!belongsToSession(message.session_id, roomName)) return
-        if (message.type === 'user_state_changed' && typeof message.state === 'string') {
+        const message = JSON.parse(new TextDecoder().decode(payload)) as Record<string, unknown>
+        if (!message || typeof message.type !== 'string' || !belongsToSession(message.session_id, session.room_name)) return
+        const sequence = readSeconds(message.turn_sequence)
+        if (message.type === 'session_started') {
+          setUserActivity('listening')
+          setAgentActivity('idle')
+          setProviderModels({
+            stt: typeof message.stt_model === 'string' ? message.stt_model : '',
+            llm: typeof message.llm_model === 'string' ? message.llm_model : '',
+            tts: typeof message.tts_model === 'string' ? message.tts_model : '',
+          })
+        } else if (message.type === 'user_state_changed' && typeof message.state === 'string') {
           setUserActivity(message.state)
           if (message.state === 'speaking') {
-            setCurrentTurnDiagnostics({
-              speechSpan: null,
-              speechEndToTurnDecision: null,
-              speechEndToFinalTranscript: null,
-              turnCommitToAgentThinking: null,
-            })
-            addDiagnosticTimelineEvent('USER_SPEECH_STARTED', 'User speech started', message)
+            userSpeechActiveRef.current = true
+            if (userTurnCommittedRef.current) activeUserMessageIdRef.current = null
+            userTurnCommittedRef.current = false
+            activeAssistantSpeechRef.current = null
+            setTimeline([])
+            addTimelineEvent('User started speaking')
           } else if (message.state === 'listening') {
-            addDiagnosticTimelineEvent('USER_SPEECH_ENDED', 'User speech ended (VAD activity only)', message)
-          } else {
-            addDiagnosticTimelineEvent('USER_STATE_CHANGED', `User is ${message.state}`, message)
+            userSpeechActiveRef.current = false
+            addTimelineEvent('User stopped speaking')
           }
         } else if (message.type === 'agent_state_changed' && typeof message.state === 'string') {
           setAgentActivity(message.state)
-          const userSpeechToAgentStopped = readNonNegativeNumber(message.user_speech_to_agent_stopped_seconds)
-          if (userSpeechToAgentStopped !== null) {
-            setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, userSpeechToAgentStopped }))
+          if (message.state === 'speaking') {
+            activeUserMessageIdRef.current = null
+            userTurnCommittedRef.current = true
+            addTimelineEvent('Agent started speaking')
           }
-          if (message.state === 'thinking') {
-            const turnCommitToAgentThinking = readNonNegativeNumber(message.turn_commit_to_agent_thinking_seconds)
-            if (turnCommitToAgentThinking !== null) {
-              setCurrentTurnDiagnostics((diagnostics) => ({ ...diagnostics, turnCommitToAgentThinking }))
-            }
-            addDiagnosticTimelineEvent('AGENT_THINKING', 'Agent started processing', message)
-          } else if (message.state === 'speaking') {
-            addDiagnosticTimelineEvent('AGENT_SPEAKING', 'Agent started speaking', message)
-          } else {
-            addDiagnosticTimelineEvent('AGENT_STATE_CHANGED', `Agent is ${message.state}`, message,
-              userSpeechToAgentStopped === null ? undefined : `User speech → agent stopped speaking (worker): ${formatMilliseconds(userSpeechToAgentStopped)}`)
+        } else if (message.type === 'conversation_item_added' && message.role === 'user') {
+          if (userSpeechActiveRef.current) return
+          const messageId = activeUserMessageIdRef.current
+          userTurnCommittedRef.current = true
+          if (messageId) setConversationMessages((messages) => messages.map((item) =>
+            item.id === messageId && item.role === 'user'
+              ? { ...item, itemId: typeof message.item_id === 'string' ? message.item_id : undefined, final: true }
+              : item,
+          ))
+          addTimelineEvent('User turn committed')
+        } else if (message.type === 'conversation_item_added' && message.role === 'assistant'
+          && typeof message.item_id === 'string' && typeof message.speech_id === 'string' && sequence !== null) {
+          const incoming: AssistantItem = {
+            itemId: message.item_id,
+            speechId: message.speech_id,
+            sequence,
+            text: typeof message.text === 'string' ? message.text : '',
+            interrupted: message.interrupted === true,
           }
-        } else if (message.type === 'conversation_item_added' && typeof message.role === 'string') {
-          if (message.role === 'assistant') {
-            const sequence = readNonNegativeNumber(message.turn_sequence)
-            if (typeof message.item_id === 'string' && typeof message.speech_id === 'string' && sequence !== null) {
-              const incoming: AssistantItem = {
-                itemId: message.item_id,
-                speechId: message.speech_id,
-                sequence,
-                text: typeof message.text === 'string' ? message.text : '',
-                interrupted: message.interrupted === true,
-              }
-              if (incoming.interrupted && !interruptedItemIdsRef.current.has(incoming.itemId)) {
-                interruptedItemIdsRef.current.add(incoming.itemId)
-                setInterruptedResponseCount(interruptedItemIdsRef.current.size)
-              }
-              const selected = selectAssistantItem(latestAssistantItemRef.current, incoming, latestSpeechSequenceRef.current)
-              const applied = selected === incoming
-              if (applied) {
-                latestSpeechSequenceRef.current = Math.max(latestSpeechSequenceRef.current, sequence)
-                latestAssistantItemRef.current = incoming
-                setAgentResponse(incoming.interrupted ? '' : incoming.text)
-                setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, assistantResponse: incoming.interrupted ? 'Interrupted' : 'Completed' }))
-              }
-              addDiagnosticTimelineEvent(
-                incoming.interrupted ? 'ASSISTANT_RESPONSE_INTERRUPTED' : 'ASSISTANT_RESPONSE_COMPLETED',
-                `Turn ${sequence} assistant item ${applied ? 'applied' : 'observed after newer speech'}`,
-                message,
-                `Speech ${incoming.speechId} · item ${incoming.itemId}`,
-              )
-            }
-          } else if (message.role === 'user') {
-            const speechSpan = readNonNegativeNumber(message.speech_span_seconds)
-            const speechEndToTurnDecision = readNonNegativeNumber(message.speech_end_to_turn_decision_seconds)
-            const speechEndToFinalTranscript = readNonNegativeNumber(message.speech_end_to_final_transcript_seconds)
-            setCurrentTurnDiagnostics((diagnostics) => ({
-              ...diagnostics,
-              speechSpan,
-              speechEndToTurnDecision,
-              speechEndToFinalTranscript,
-            }))
-            addDiagnosticTimelineEvent(
-              'USER_TURN_COMMITTED',
-              'User conversation item committed and available to the agent',
-              message,
-              `Item ${typeof message.item_id === 'string' ? message.item_id : 'unknown'}${speechEndToTurnDecision === null ? '' : ` · end-of-turn decision ${formatMilliseconds(speechEndToTurnDecision)}`}`,
-            )
-          } else {
-            addDiagnosticTimelineEvent('CONVERSATION_ITEM_COMMITTED', `Committed ${message.role} conversation item`, message)
-          }
-        } else if (message.type === 'overlapping_speech' && typeof message.is_interruption === 'boolean') {
-          const result = message.agent_ended === true ? 'Inconclusive (agent ended)' : message.is_interruption ? 'Interruption' : 'Backchannel'
-          const detectionDelay = readNonNegativeNumber(message.detection_delay_seconds)
-          const predictionDuration = readNonNegativeNumber(message.prediction_duration_seconds)
-          const totalDuration = readNonNegativeNumber(message.total_duration_seconds)
-          const probability = readNonNegativeNumber(message.probability)
-          const requestCount = readNonNegativeNumber(message.num_requests)
-          setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, overlap: result, detectionDelay, predictionDuration, totalDuration, probability, requestCount }))
-          addDiagnosticTimelineEvent('OVERLAPPING_SPEECH', `LiveKit classified overlap: ${result.toLowerCase()}`, message,
-            `Detection ${formatMilliseconds(detectionDelay)} · prediction ${formatMilliseconds(predictionDuration)} · RTT ${formatMilliseconds(totalDuration)}${requestCount === null ? '' : ` · ${requestCount} requests`}`)
-        } else if (message.type === 'agent_false_interruption' && typeof message.resumed === 'boolean') {
-          setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, falseInterruptionResumed: message.resumed ? 'Yes' : 'No' }))
-          addDiagnosticTimelineEvent('AGENT_FALSE_INTERRUPTION', 'LiveKit detected a false interruption', message,
-            `Speech resumed automatically: ${message.resumed ? 'yes' : 'no'}`)
-        } else if (message.type === 'speech_created' && typeof message.speech_id === 'string') {
-          const sequence = readNonNegativeNumber(message.turn_sequence)
-          if (sequence !== null) {
-            if (sequence > latestSpeechSequenceRef.current) {
-              latestSpeechSequenceRef.current = sequence
-              if (!finishedSpeechIdsRef.current.has(message.speech_id)) {
-                setActiveSpeechId(message.speech_id)
-                setAgentResponse('')
-                setInterruptionDiagnostics((diagnostics) => ({ ...diagnostics, assistantResponse: 'In progress' }))
-              }
-            }
-            addDiagnosticTimelineEvent('SPEECH_CREATED', `Turn ${sequence} response created`, message, `Speech ${message.speech_id}`)
-          }
-        } else if (message.type === 'speech_finished' && typeof message.speech_id === 'string') {
-          const sequence = readNonNegativeNumber(message.turn_sequence)
-          if (sequence !== null) {
-            finishedSpeechIdsRef.current.add(message.speech_id)
+          const selected = selectAssistantItem(latestAssistantItemRef.current, incoming, latestSpeechSequenceRef.current)
+          const transcriptId = assistantMessageBySpeechRef.current.get(incoming.speechId)
+          if (transcriptId) setConversationMessages((messages) => messages.map((item) =>
+            item.id === transcriptId && item.role === 'assistant'
+              ? { ...item, itemId: incoming.itemId, text: incoming.text || item.text, final: true, interrupted: incoming.interrupted }
+              : item,
+          ))
+          if (selected === incoming) {
             latestSpeechSequenceRef.current = Math.max(latestSpeechSequenceRef.current, sequence)
-            if (sequence === latestSpeechSequenceRef.current) setActiveSpeechId(null)
-            addDiagnosticTimelineEvent('SPEECH_FINISHED', `Turn ${sequence} ${message.interrupted === true ? 'interrupted' : 'finished'}`, message,
-              `Speech ${message.speech_id}${typeof message.item_id === 'string' ? ` · item ${message.item_id}` : ''}`)
+            latestAssistantItemRef.current = incoming
+            if (incoming.text && !transcriptId) setConversationMessages((messages) =>
+              messages.some((item) => item.itemId === incoming.itemId || item.id === incoming.itemId)
+                ? messages
+                : [...messages, { id: incoming.itemId, itemId: incoming.itemId, role: 'assistant', text: incoming.text, final: true, interrupted: incoming.interrupted }],
+            )
           }
-        } else if (message.type === 'turn_metrics' && typeof message.item_id === 'string') {
-          const itemId = message.item_id
-          const turnSequence = readNonNegativeNumber(message.turn_sequence)
-          if (turnSequence !== null) {
-            const result = mergeTurnMetrics(completedTurnLatenciesRef.current, latestCompletedTurnRef.current,
-              itemId, turnSequence, message.completed === true, readTurnLatency(message) ?? {})
-            latestCompletedTurnRef.current = result.latestCompleted
-            if (result.visibleLatency) setTurnLatency(result.visibleLatency)
+        } else if (message.type === 'speech_created' && typeof message.speech_id === 'string' && sequence !== null) {
+          if (sequence > latestSpeechSequenceRef.current) {
+            latestSpeechSequenceRef.current = sequence
+            activeUserMessageIdRef.current = null
+            userTurnCommittedRef.current = true
+            activeAssistantSpeechRef.current = { speechId: message.speech_id, messageId: null }
           }
-
-          const speechId = typeof message.speech_id === 'string' ? message.speech_id : 'unknown speech'
-          addDiagnosticTimelineEvent(
-            turnSequence !== null && turnSequence < latestSpeechSequenceRef.current ? 'LATE_RESPONSE_METRIC' : 'RESPONSE_METRICS_RECEIVED',
-            `Turn ${turnSequence ?? 'unknown'} metrics updated (${speechId})`,
-            message,
+        } else if (message.type === 'turn_metrics' && typeof message.item_id === 'string' && sequence !== null) {
+          const result = mergeTurnMetrics(
+            completedTurnLatenciesRef.current, latestCompletedTurnRef.current,
+            message.item_id, sequence, message.completed === true, readTurnLatency(message),
           )
-        } else if (message.type === 'provider_metric') {
-          const providerMetric = readLatestProviderMetric(message)
-          if (providerMetric) setLatestProviderMetric(providerMetric)
-        } else if (message.type === 'speech_provider_metric' && typeof message.speech_id === 'string') {
-          const sequence = readNonNegativeNumber(message.turn_sequence)
-          const providerMetric = readLatestProviderMetric(message)
-          addDiagnosticTimelineEvent(
-            sequence !== null && sequence < latestSpeechSequenceRef.current ? 'LATE_PROVIDER_METRIC' : 'INTERRUPTED_PROVIDER_METRIC',
-            `Turn ${sequence ?? 'unknown'} ${message.metric_type === 'tts' ? 'TTS' : 'LLM'} metric observed after interruption/newer speech`,
-            message,
-            `Speech ${message.speech_id}${providerMetric ? ` · ${providerMetric.values}` : ''}`,
-          )
-        } else if (message.type === 'session_usage' && Array.isArray(message.items)) {
-          setUsage(message.items.map((item) => {
-            const values = item as Record<string, unknown>
-            return `${values.type}: ${values.input_tokens ?? 0} in / ${values.output_tokens ?? 0} out`
-          }).join(' · ') || 'No provider usage yet')
-        } else if (message.type === 'session_started' && typeof message.llm_model === 'string') {
-          setLlmModel(message.llm_model)
-          setTurnConfiguration(readTurnConfiguration(message.turn_configuration))
-          const configuration = message.turn_configuration
-          if (typeof configuration === 'object' && configuration !== null && 'interruption_mode' in configuration && typeof configuration.interruption_mode === 'string') {
-            setInterruptionMode(`${configuration.interruption_mode} (configured)`)
+          latestCompletedTurnRef.current = result.latestCompleted
+          if (message.completed === true && typeof message.speech_id === 'string') {
+            const itemId = message.item_id
+            const speechId = message.speech_id
+            const latency = completedTurnLatenciesRef.current.get(itemId)
+            if (latency) setRecentTurns((turns) => updateRecentTurns(turns, {
+              itemId,
+              speechId,
+              userItemId: typeof message.user_item_id === 'string' ? message.user_item_id : undefined,
+              sequence,
+              latency,
+            }))
           }
-          setUserActivity('listening')
-          setAgentActivity('idle')
-          addDiagnosticTimelineEvent('SESSION_READY', 'Voice pipeline ready', message)
-        } else if (message.type === 'session_error' && typeof message.source === 'string' && typeof message.message === 'string') {
-          setSessionDiagnosticError(`${message.source}: ${sanitizeConnectionErrorMessage(message.message)}`)
-          addDiagnosticTimelineEvent('SESSION_ERROR', `Provider error: ${message.source}`, message)
-        } else if (message.type === 'session_closed') addDiagnosticTimelineEvent('SESSION_CLOSED', 'Voice pipeline closed', message)
+        } else if (message.type === 'barge_in' && typeof message.speech_id === 'string' && sequence !== null) {
+          const latency = readSeconds(message.barge_in_seconds)
+          if (latency !== null) {
+            setInterruptions((events) => [
+              { speechId: message.speech_id as string, sequence, seconds: latency },
+              ...events.filter((event) => event.speechId !== message.speech_id),
+            ].sort((first, second) => second.sequence - first.sequence).slice(0, 5))
+            addTimelineEvent(`Interrupted — agent stopped in ${formatMilliseconds(latency)} (worker)`)
+          }
+        } else if (message.type === 'state_analysis_started' && typeof message.item_id === 'string' && sequence !== null) {
+          const current = latestStateTurnRef.current
+          if (!current || sequence > current.sequence) {
+            latestStateTurnRef.current = { itemId: message.item_id, sequence }
+            setStateStatus('Analyzing current turn')
+            setStrategy('Waiting for analysis')
+            setConversationState(unknownState)
+            setStateConfidence(null)
+          }
+        } else if (message.type === 'state_analysis_failed' && typeof message.item_id === 'string') {
+          if (message.item_id === latestStateTurnRef.current?.itemId) {
+            setStateStatus(`State analysis failed: ${sanitizeError(typeof message.message === 'string' ? message.message : 'Unknown error')}`)
+          }
+          addTimelineEvent('State analysis error')
+        } else if (message.type === 'conversation_state_updated' && typeof message.item_id === 'string' && sequence !== null) {
+          const state = readConversationState(message.turn_state)
+          if (state && message.item_id === latestStateTurnRef.current?.itemId && sequence === latestStateTurnRef.current.sequence) {
+            setConversationState(state)
+            setStateConfidence(typeof message.confidence === 'number' && Number.isFinite(message.confidence)
+              && message.confidence >= 0 && message.confidence <= 1 ? message.confidence : null)
+            setStateStatus('Updated for current turn')
+            addTimelineEvent('Conversational state updated')
+          }
+        } else if (message.type === 'strategy_selected' && typeof message.item_id === 'string'
+          && typeof message.strategy === 'string' && sequence !== null) {
+          if (message.item_id === latestStateTurnRef.current?.itemId && sequence === latestStateTurnRef.current.sequence) {
+            setStrategy(message.strategy)
+            addTimelineEvent(`Strategy selected: ${message.strategy.toLowerCase()}`)
+          }
+        } else if (message.type === 'session_error' && typeof message.message === 'string') {
+          setSessionError(sanitizeError(message.message))
+          addTimelineEvent('Voice session error')
+        }
       } catch {
-        // Ignore malformed data messages from the room.
+        // Ignore malformed room data.
       }
     }
     roomEventHandlersRef.current = { connectionStateChanged, participantChanged, microphonePublicationChanged, trackSubscribed, trackUnsubscribed, transcriptionReceived, audioPlaybackStatusChanged, dataReceived }
@@ -703,40 +544,49 @@ function App() {
     room.on(RoomEvent.AudioPlaybackStatusChanged, audioPlaybackStatusChanged)
     room.on(RoomEvent.DataReceived, dataReceived)
     try {
-      await room.connect(serverUrl, token)
+      await room.connect(session.server_url, session.token)
       connectionAttemptRef.current = null
-      if (roomRef.current !== room) return
+      if (roomRef.current !== room) return null
       for (const participant of room.remoteParticipants.values()) {
         for (const publication of participant.trackPublications.values()) {
           if (publication.track) attachRemoteAudio(room, publication.track)
         }
       }
       setConnectionStatus('Connected')
-      setRemoteParticipantCount(room.remoteParticipants.size)
       updateAudioPlayback(room)
       syncMicrophoneState(room)
+      return room
     } catch (error) {
-      if (connectionAttemptRef.current !== room) return
-      setConnectionError(sanitizeConnectionErrorMessage(error instanceof Error ? error.message : 'LiveKit connection failed.'))
+      if (connectionAttemptRef.current !== room) return null
+      const reason = sanitizeError(error instanceof Error ? error.message : 'LiveKit connection failed.')
       disconnectRoom()
+      setConnectionError(reason)
       setConnectionStatus('Connection failed')
+      return null
     }
   }
 
   function disconnectRoom() {
+    startAttemptRef.current += 1
+    startingRef.current = false
+    setStartingStep('')
     const room = roomRef.current
-    if (!room) return
+    if (!room) {
+      setSessionStatus('No session created')
+      setRoomName('')
+      return
+    }
     removeRoomEventListeners(room)
     removeAllRemoteAudio()
     roomRef.current = null
     connectionAttemptRef.current = null
     microphoneRequestRoomRef.current = null
-    stopMicrophoneAnalyser()
     void room.disconnect()
     setConnectionStatus('Disconnected')
     setMicrophoneStatus('Microphone off')
-    setRemoteParticipantCount(0)
-    resetConversationState()
+    resetConversation()
+    setSessionStatus('No session created')
+    setRoomName('')
   }
 
   async function enableMicrophone() {
@@ -772,145 +622,206 @@ function App() {
     }
   }
 
-  async function enableAudio() {
-    const room = roomRef.current
+  async function enableAudio(room = roomRef.current) {
     if (!room) return
     try {
       audioPlaybackErrorRef.current = ''
       await room.startAudio()
       updateAudioPlayback(room)
     } catch (error) {
-      audioPlaybackErrorRef.current = sanitizeConnectionErrorMessage(
-        error instanceof Error ? error.message : 'Audio playback could not be enabled.',
-      )
+      audioPlaybackErrorRef.current = sanitizeError(error instanceof Error ? error.message : 'Audio playback could not be enabled.')
       updateAudioPlayback(room)
     }
   }
 
+  async function startSession() {
+    if (startingRef.current || roomRef.current) return
+    startingRef.current = true
+    const attempt = ++startAttemptRef.current
+    setStartingStep('Starting...')
+    const session = await createSession()
+    if (!session || attempt !== startAttemptRef.current) {
+      if (attempt === startAttemptRef.current) {
+        startingRef.current = false
+        setStartingStep('')
+      }
+      return
+    }
+    setStartingStep('Connecting...')
+    const room = await connectRoom(session)
+    if (!room || attempt !== startAttemptRef.current) {
+      if (attempt === startAttemptRef.current) {
+        startingRef.current = false
+        setStartingStep('')
+      }
+      return
+    }
+    await enableAudio(room)
+    if (attempt !== startAttemptRef.current || roomRef.current !== room) return
+    setStartingStep('Turning on microphone...')
+    await enableMicrophone()
+    if (attempt === startAttemptRef.current) {
+      startingRef.current = false
+      setStartingStep('')
+    }
+  }
+
+  const lunaSpeaking = connectionStatus === 'Connected' && agentActivity === 'speaking' && userActivity !== 'speaking'
+  const voiceState = startingStep || (connectionStatus === 'Connected'
+    ? userActivity === 'speaking' ? 'Listening'
+      : lunaSpeaking ? 'Luna is speaking'
+        : agentActivity === 'thinking' ? 'Thinking'
+          : microphoneStatus === 'Muted' ? 'Muted'
+            : microphoneStatus === 'Error' || microphoneStatus === 'Microphone off' ? 'Microphone needed'
+              : 'Listening'
+    : connectionStatus === 'Reconnecting' ? 'Reconnecting...' : 'Here with you')
+  const currentStrategy = strategyDetails[strategy]
+  const activeErrors = [
+    connectionError, microphoneError, sessionError,
+    sessionStatus.startsWith('Unable') ? sessionStatus : '',
+    audioPlayback.includes('failed') || audioPlayback.startsWith('Browser autoplay blocked') ? audioPlayback : '',
+    stateStatus.startsWith('State analysis failed') ? stateStatus : '',
+  ].filter(Boolean)
+  const latestTurn = recentTurns[0]
+  const selectedTurn = recentTurns.find((turn) => turn.itemId === selectedTurnId) ?? latestTurn
+  const selectedLatency = selectedTurn?.latency
+  const bottleneck = selectedLatency ? slowestStage(selectedLatency) : null
+  const speakableGap = selectedLatency?.firstSpeakableText !== undefined && selectedLatency.llmFirstToken !== undefined
+    ? selectedLatency.firstSpeakableText - selectedLatency.llmFirstToken : null
+  const selectedInterruption = interruptions.find((event) => event.speechId === selectedTurn?.speechId)
+    ?? (selectedTurnId ? undefined : interruptions[0])
+  const measurements = selectedLatency ? [
+    { label: 'Final transcript after speech', meaning: 'Speech ended → final transcript ready', value: selectedLatency.finalTranscript },
+    { label: 'Turn detection', meaning: 'Speech ended → user turn accepted complete', value: selectedLatency.turnDetection },
+    { label: 'Turn processing', meaning: 'User-turn callback began → callback finished', value: selectedLatency.turnProcessing },
+    { label: 'LLM first token', meaning: selectedLatency.llmFirstTokenSource === 'provider' ? 'LLM provider request began → first token returned' : 'LLM generation began → first token returned', value: selectedLatency.llmFirstToken },
+    { label: 'First speakable text', meaning: 'LLM generation began → first TTS-ready sentence', value: selectedLatency.firstSpeakableText },
+    { label: 'TTS first audio', meaning: selectedLatency.ttsFirstAudioSource === 'provider' ? 'TTS provider request began → first audio chunk returned' : 'First text reached TTS → first audio chunk returned', value: selectedLatency.ttsFirstAudio },
+    { label: 'Audio output start', meaning: 'First audio frame forwarded → output reported playback started', value: selectedLatency.audioOutputStart },
+    { label: 'Voice response', meaning: selectedLatency.responseSource === 'worker_state_fallback' ? 'Worker user-speech end → agent speaking state' : 'User speech ended → agent response began at server output', value: selectedLatency.responseLatency },
+  ].filter((row) => row.value !== undefined && (row.label !== 'Turn processing' || row.value >= 0.02)) : []
+
   return (
-    <div className="shell">
-      <aside className="sidebar" aria-label="Main navigation"><div className="brand"><div className="mark" aria-hidden="true"><i /><i /><i /><i /><i /></div><span>voicely<span className="brand-accent">.</span></span></div><div><p className="nav-label">Workspace</p><nav className="nav" aria-label="Sections"><a className="active" href="#session"><span>Voice session</span></a><a href="#diagnostics"><span>Diagnostics</span></a></nav></div><div className="sidebar-bottom"><div className="phase">Phase 2B</div><p>Turn handling and interruption visibility.</p></div></aside>
-      <main className="main">
-        <header className="top"><h1>Voice Companion / Session</h1><div className={`backend-status ${backendStatus === 'Backend connected' ? 'is-ready' : ''}`}><span>{backendStatus}</span><button type="button" onClick={() => setRetryAttempt((attempt) => attempt + 1)}>Retry</button></div></header>
-        <div className="layout"><div className="column">
-          <div className="intro"><p className="eyebrow">A space to be heard</p><h2>Speak freely.<br />One moment at a time.</h2><p>Connect, enable your microphone, and hear the companion respond through the same LiveKit room.</p></div>
-          <section className="card voice-card" id="session" aria-labelledby="session-heading"><div className="status-row"><h3 className="section-title" id="session-heading">Your voice space</h3><span className={`status ${connectionStatus === 'Connected' ? 'is-connected' : ''}`}>{connectionStatus}</span></div><div className="orb-wrap" aria-hidden="true"><div className="ring ring-two" /><div className="ring" /><div className="orb">&#9834;</div></div><div className="voice-copy"><h3>{connectionStatus === 'Connected' ? 'Connected and ready' : 'Ready when you are'}</h3><p>{connectionStatus === 'Connected' ? microphoneStatus : 'Create a session, then connect when you are ready to speak.'}</p></div><div className="controls" aria-label="Voice controls"><button className="button primary" type="button" onClick={() => void createSession()} disabled={roomIsActive}>Create session</button><button className="button" type="button" onClick={() => void connectRoom()} disabled={!hasSessionConnectionDetails || roomIsActive}>Connect</button><button className="button" type="button" onClick={() => void enableMicrophone()} disabled={connectionStatus !== 'Connected' || microphoneStatus !== 'Microphone off'}>Enable mic</button><button className="button" type="button" onClick={() => void toggleMicrophoneMute()} disabled={connectionStatus !== 'Connected' || !['Publishing microphone', 'Muted'].includes(microphoneStatus)}>{microphoneStatus === 'Muted' ? 'Unmute' : 'Mute'}</button><button className="button" type="button" onClick={() => void enableAudio()} disabled={connectionStatus !== 'Connected'}>Enable audio</button><button className="button end-button" type="button" onClick={disconnectRoom} disabled={!roomIsActive}>End</button></div><p className="control-note">Session: {sessionStatus}</p>{(connectionError || microphoneError || sessionDiagnosticError) && <p className="error-message" role="alert">{connectionError || microphoneError || sessionDiagnosticError}</p>}<div ref={audioContainerRef} className="remote-audio" aria-hidden="true" /></section>
-          <section className="card panel" id="diagnostics" aria-labelledby="diagnostics-heading">
-            <div className="panel-head"><h3 id="diagnostics-heading">Latency</h3><span>Latest completed turn</span></div>
-            <div className="metrics">
-              <div className="metric"><small>LLM first token</small><strong>{formatMilliseconds(turnLatency?.llmFirstToken ?? null)}</strong></div>
-              <div className="metric"><small>LLM generation</small><strong>{formatMilliseconds(turnLatency?.llmDuration ?? null)}</strong></div>
-              <div className="metric"><small>TTS first audio chunk</small><strong>{formatMilliseconds(turnLatency?.ttsFirstAudio ?? null)}</strong></div>
-              <div className="metric"><small>TTS generation</small><strong>{formatMilliseconds(turnLatency?.ttsDuration ?? null)}</strong></div>
-              <div className="metric"><small>Speech end → agent audio (server)</small><strong>{formatMilliseconds(turnLatency?.speechEndToAgentAudio ?? null)}</strong></div>
+    <div className="luna-app">
+      <div className="night-scene" aria-hidden="true">
+        <div className="stars" /><div className="sky-glow" /><div className="mountain mountain-back" /><div className="mountain mountain-front" /><div className="lake" /><div className="distant-shore" /><div className="field" />
+        <div className="resting-figure"><span className="figure-head" /><span className="figure-body" /><span className="figure-legs" /></div>
+        <div className="wind wind-one" /><div className="wind wind-two" /><div className="wind wind-three" /><div className="wind wind-four" />
+        {Array.from({ length: 6 }, (_, index) => <span className={`leaf leaf-${index + 1}`} key={index} />)}
+      </div>
+      <div className="luna-content">
+        <header className="luna-header">
+          <div className="luna-brand"><span className="brand-moon" aria-hidden="true" /><div><h1>Luna</h1><p>A calmer you, always here</p></div></div>
+          <span className={`session-indicator ${connectionStatus === 'Connected' ? 'is-connected' : ''}`}><span className="status-dot" />{connectionStatus === 'Connected' ? 'Connected' : startingStep || 'A quiet place to talk'}</span>
+        </header>
+        <main className={`luna-layout ${roomIsActive ? 'has-session' : ''}`}>
+          <section className="moon-stage" aria-label="Luna voice session">
+            <div className={`moon-zone ${lunaSpeaking ? 'moon-speaking' : agentActivity === 'thinking' && userActivity !== 'speaking' ? 'moon-thinking' : ''}`} aria-hidden="true">
+              <span className="moon-ring ring-one" /><span className="moon-ring ring-two" /><span className="moon-ring ring-three" /><span className="moon-disc" />
             </div>
-            <div className="diagnostic-subsection">
-              <div className="panel-head compact"><h3>Current user turn</h3><span>Native turn signals</span></div>
-              <div className="metrics turn-metrics">
-                <div className="metric"><small>Speech span (first start to final end)</small><strong>{formatMilliseconds(currentTurnDiagnostics.speechSpan)}</strong></div>
-                <div className="metric"><small>Speech end to end-of-turn decision</small><strong>{formatMilliseconds(currentTurnDiagnostics.speechEndToTurnDecision)}</strong></div>
-                <div className="metric"><small>Speech end to final transcript</small><strong>{formatMilliseconds(currentTurnDiagnostics.speechEndToFinalTranscript)}</strong></div>
-                <div className="metric"><small>Turn commit to agent thinking</small><strong>{formatMilliseconds(currentTurnDiagnostics.turnCommitToAgentThinking)}</strong></div>
-              </div>
-            </div>
-            <div className="diagnostic-subsection">
-              <div className="panel-head compact"><h3>Turn handling</h3><span>Worker configuration</span></div>
-              <div className="connection-details turn-configuration">
-                <span>VAD <strong>{turnConfiguration?.vad ?? 'Unavailable'}</strong></span>
-                <span>VAD min silence <strong>{formatMilliseconds(turnConfiguration?.vadMinSilence ?? null)} configured</strong></span>
-                <span>Turn detection <strong>{turnConfiguration?.turnDetection ?? 'Unavailable'}</strong></span>
-                <span>Turn detector model <strong>{turnConfiguration?.turnDetectionModel ?? 'Unavailable'}</strong></span>
-                <span>Endpointing mode <strong>{turnConfiguration ? `${turnConfiguration.endpointingMode} (${turnConfiguration.endpointingModeSource})` : 'Unavailable'}</strong></span>
-                <span>Min endpoint delay <strong>{turnConfiguration ? `${formatMilliseconds(turnConfiguration.minEndpointingDelay)} ${turnConfiguration.minEndpointingDelaySource}` : 'Unavailable'}</strong></span>
-                <span>Max endpoint delay <strong>{turnConfiguration ? `${formatMilliseconds(turnConfiguration.maxEndpointingDelay)} ${turnConfiguration.maxEndpointingDelaySource}` : 'Unavailable'}</strong></span>
-                <span>Preemptive generation <strong>{turnConfiguration ? (turnConfiguration.preemptiveGenerationEnabled ? 'enabled' : 'disabled') : 'Unavailable'}</strong></span>
-              </div>
-            </div>
-            <div className="diagnostic-subsection">
-              <div className="panel-head compact"><h3>Interruption</h3><span>Native LiveKit events</span></div>
-              <div className="connection-details turn-configuration">
-                <span>Interruption mode <strong>{interruptionMode}</strong></span>
-                <span>Last overlap <strong>{interruptionDiagnostics.overlap}</strong></span>
-                <span>Detection delay <strong>{formatMilliseconds(interruptionDiagnostics.detectionDelay)}</strong></span>
-                <span>Prediction duration <strong>{formatMilliseconds(interruptionDiagnostics.predictionDuration)}</strong></span>
-                <span>Detector RTT <strong>{formatMilliseconds(interruptionDiagnostics.totalDuration)}</strong></span>
-                <span>Probability <strong>{interruptionDiagnostics.probability === null ? '—' : `${(interruptionDiagnostics.probability * 100).toFixed(0)}%`}</strong></span>
-                <span>Detector requests <strong>{interruptionDiagnostics.requestCount ?? '—'}</strong></span>
-                <span>Last assistant response <strong>{interruptionDiagnostics.assistantResponse}</strong></span>
-                <span>False interruption resumed <strong>{interruptionDiagnostics.falseInterruptionResumed}</strong></span>
-                <span>User speech → agent stopped speaking (worker) <strong>{formatMilliseconds(interruptionDiagnostics.userSpeechToAgentStopped)}</strong></span>
-              </div>
-            </div>
-            <div className="diagnostic-subsection">
-              <div className="panel-head compact"><h3>Response ownership</h3><span>Current room</span></div>
-              <div className="connection-details turn-configuration">
-                <span>Session <strong>{roomName || 'None'}</strong></span>
-                <span>Active response speech <strong>{activeSpeechId || 'None'}</strong></span>
-                <span>Latest assistant item <strong>{latestAssistantItemRef.current?.itemId || 'None'}</strong></span>
-                <span>Interrupted assistant items <strong>{interruptedResponseCount}</strong></span>
-              </div>
-            </div>
-            <div className="connection-details">
-              <span>Latest provider metric (uncorrelated) <strong>{latestProviderMetric ? `${latestProviderMetric.metricType}: ${latestProviderMetric.values}${latestProviderMetric.speechId ? ` · speech ${latestProviderMetric.speechId}` : ''}` : 'None'}</strong></span>
-            </div>
-            <div className="connection-details"><span>LLM model <strong>{llmModel}</strong></span><span>Audio playback <strong>{audioPlayback.status}</strong></span><span>Room <strong>{roomName || 'Not connected'}</strong></span><span>Local participant <strong>{participantIdentity || 'Not available'}</strong></span><span>Remote participants <strong>{connectionStatus === 'Connected' ? remoteParticipantCount : '-'}</strong></span><span>Session usage <strong>{usage}</strong></span>{audioPlayback.error && <span>Playback error <strong>{audioPlayback.error}</strong></span>}</div>
+            <h2>Luna</h2>
+            <p className="moon-status" aria-live="polite">{voiceState}</p>
+            <span className="moon-divider" aria-hidden="true" />
+            <p className="moon-caption">A little space to be heard.</p>
           </section>
-        </div><div className="column">
-          <section className="card conversation" aria-labelledby="conversation-heading">
-            <div className="panel-head"><h3 id="conversation-heading">Conversation</h3><span>{agentActivity}</span></div>
-            <div className="conversation-debug">
-              <div className="debug-row"><small>User activity</small><strong className={`activity ${userActivity}`}>{userActivity}</strong></div>
-              <div className="debug-row"><small>Agent activity</small><strong className={`activity ${agentActivity}`}>{agentActivity}</strong></div>
-              <div className="debug-block"><small>Microphone signal</small><p>{microphoneLevel === null ? 'Enable the microphone to inspect its local input level.' : microphoneStatus === 'Muted' ? 'Muted' : `Local input level: ${microphoneLevel.toFixed(3)}`}</p></div>
-              <div className="debug-block"><small>Current partial user transcript</small><p>{partialTranscript || 'Waiting for speech recognition...'}</p></div>
-              <div className="debug-block"><small>Final user transcriptions</small>{finalTranscripts.length ? <ol className="transcript-history">{finalTranscripts.map((transcript) => <li key={transcript.id}>{transcript.text}</li>)}</ol> : <p>No final user transcription yet.</p>}</div>
-              <div className="debug-block"><small>Generated agent response</small><p>{agentResponse || 'Waiting for a committed agent response...'}</p></div>
-              <div className="debug-block"><small>Speech-synchronized agent text</small><p>{agentSpeechText || 'Waiting for agent audio...'}</p></div>
-              <div className="debug-block">
-                <small>Checkpoint 2A manual prompts</small>
-                <ul className="test-prompts">
-                  <li>
-                    <strong>Test A — clearly complete:</strong> Say “What is Redis?” Record end-of-turn delay, speech end → agent audio, and LLM TTFT. Does the detector close the completed utterance efficiently?
-                  </li>
-                  <li>
-                    <strong>Test B — short hesitation:</strong> Say “I've been thinking that...”, pause approximately 1 second, then say “...I should change my project.” Observe whether USER_TURN_COMMITTED or AGENT_THINKING occurs during the pause, or whether both phrases remain one user turn.
-                  </li>
-                  <li>
-                    <strong>Test C — long silence:</strong> Say “I don't know...” and stay silent. Record end-of-turn delay and when the turn commits; check that it waits appropriately without hanging.
-                  </li>
-                </ul>
-              </div>
-              <div className="debug-block">
-                <small>Checkpoint 2B manual scenarios</small>
-                <ul className="test-prompts">
-                  <li><strong>1. Genuine interruption:</strong> During a long response say “Wait, stop.” Check overlap verdict, agent stop, interrupted assistant item, and next user turn. Record detection delay and worker stop time.</li>
-                  <li><strong>2. Semantic correction:</strong> During agent speech say “No, that's not what I meant.” Check that the prior answer stops and the correction receives a response.</li>
-                  <li><strong>3. “OK” backchannel:</strong> During agent speech say “OK.” Record the native overlap verdict and whether speech continues.</li>
-                  <li><strong>4. “Hmm” backchannel:</strong> During agent speech say “Hmm.” Record the native overlap verdict and whether speech continues.</li>
-                  <li><strong>5. Brief noise:</strong> Make a small non-speech sound. Watch VAD state, overlap verdict, and false interruption recovery.</li>
-                </ul>
-              </div>
-              <div className="debug-block">
-                <small>Pipeline event timeline</small>
-                {diagnosticTimeline.length ? (
-                  <ol className="diagnostic-timeline">
-                    {diagnosticTimeline.map((event) => (
-                      <li key={event.id}>
-                        <time>{event.timestamp}</time>
-                        <code>{event.type}</code>
-                        <span>{event.message}</span>
-                        {event.sessionElapsedSeconds !== null && <em>+{event.sessionElapsedSeconds.toFixed(3)} s worker time</em>}
-                        {event.details && <em>{event.details}</em>}
-                      </li>
-                    ))}
-                  </ol>
-                ) : <p>No session events yet.</p>}
-              </div>
+
+          {roomIsActive && <section className="glass-panel conversation-panel" aria-labelledby="conversation-heading">
+            <div className="panel-heading"><h2 id="conversation-heading">Conversation</h2><span className="panel-live"><span className="status-dot" />Live</span></div>
+            <div className="conversation-messages" aria-live="polite">
+              {conversationMessages.length === 0 && <p className="empty">Your words will appear here when you speak.</p>}
+              {conversationMessages.map((message) => <div className={`message ${message.final ? '' : 'partial'}`} key={message.id}>
+                <span className={`message-dot ${message.role}`} aria-hidden="true" />
+                <div className="message-content"><div className="message-meta"><strong>{message.role === 'assistant' ? 'Luna' : 'You'}</strong>{message.interrupted ? <span>Interrupted</span> : !message.final ? <span>{message.role === 'user' ? 'Listening' : 'Speaking'}</span> : null}</div><p>{message.text}</p></div>
+              </div>)}
             </div>
-          </section>
-        </div></div>
-        <p className="footer">Voice Companion · Phase 2B exposes native turn and interruption signals. Worker timing is not browser-audible playback timing.</p>
-      </main>
+          </section>}
+
+          {roomIsActive && <aside className="insight-column">
+            <section className="glass-panel state-panel" aria-labelledby="state-heading">
+              <div className="panel-heading"><h2 id="state-heading">Current state</h2></div>
+              <p className="state-summary">{conversationState.sentiment === 'UNKNOWN'
+                ? stateStatus === 'Updated for current turn' ? 'Tone unknown this turn' : 'Awaiting analysis'
+                : `${conversationState.sentiment.toLowerCase()} tone`}</p>
+              <div className="state-values">{(['energy', 'stress', 'frustration'] as const).map((dimension) => <div key={dimension}><span>{dimension}</span><strong>{conversationState[dimension].toLowerCase()}</strong></div>)}</div>
+              {stateConfidence !== null && <p className="state-confidence">Current turn confidence: {Math.round(stateConfidence * 100)}%</p>}
+            </section>
+            <section className="glass-panel strategy-panel" aria-labelledby="strategy-heading">
+              <div className="panel-heading"><h2 id="strategy-heading">Guided strategy</h2></div>
+              <strong>{currentStrategy?.title ?? strategy.replaceAll('_', ' ')}</strong>
+              <p>{currentStrategy?.description ?? 'Waiting for the next turn.'}</p>
+            </section>
+            <section className="glass-panel response-panel" aria-label="Voice response"><span className="eyebrow">Voice response</span><strong>{formatMilliseconds(latestTurn?.latency.responseLatency ?? null)}</strong><p>{latestTurn?.latency.responseSource === 'native' ? 'Speech end → agent response · server output' : latestTurn?.latency.responseSource === 'worker_state_fallback' ? 'Speech end → agent speaking · worker estimate' : 'Awaiting a completed response'}</p></section>
+          </aside>}
+        </main>
+        <div className="luna-bottom">
+          <div className="voice-dock" aria-label="Voice controls">
+            {!roomIsActive && !startingStep && <button className="chat-button" type="button" onClick={() => void startSession()}>Let’s chat <span aria-hidden="true">→</span></button>}
+            {startingStep && <button className="chat-button" type="button" disabled>{startingStep}</button>}
+            {roomIsActive && <>
+              <button className="dock-button" type="button" onClick={() => void (microphoneStatus === 'Microphone off' || microphoneStatus === 'Error' ? enableMicrophone() : toggleMicrophoneMute())} disabled={connectionStatus !== 'Connected' || !['Microphone off', 'Publishing microphone', 'Muted', 'Error'].includes(microphoneStatus)} aria-label={microphoneStatus === 'Microphone off' || microphoneStatus === 'Error' ? 'Enable microphone' : microphoneStatus === 'Muted' ? 'Unmute microphone' : 'Mute microphone'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3" /><path d="M5 10a7 7 0 0 0 14 0M12 17v5m-4 0h8" />{microphoneStatus === 'Muted' && <path d="M3 3l18 18" />}</svg>{microphoneStatus === 'Muted' ? 'Unmute' : microphoneStatus === 'Microphone off' || microphoneStatus === 'Error' ? 'Enable mic' : 'Mute'}</button>
+              <span className="dock-state"><span className="status-dot" />{voiceState}</span>
+              <button className="dock-button end-button" type="button" onClick={disconnectRoom}>End session</button>
+              {(audioPlayback === 'Enable audio playback' || audioPlayback.startsWith('Browser autoplay blocked') || audioPlayback.includes('failed')) && <button className="dock-button" type="button" onClick={() => void enableAudio()}>Enable audio</button>}
+            </>}
+          </div>
+          {(connectionError || microphoneError || sessionError || sessionStatus.startsWith('Unable') || audioPlayback.startsWith('Browser autoplay blocked')) && <p className="error-message" role="alert">{connectionError || microphoneError || sessionError || (sessionStatus.startsWith('Unable') ? sessionStatus : '') || audioPlayback}</p>}
+          <button type="button" className="debug-button" onClick={() => setDebugOpen(true)}>Debug <span aria-hidden="true">↗</span></button>
+        </div>
+      </div>
+      <div ref={audioContainerRef} hidden />
+
+      {debugOpen && <div className="debug-modal" onMouseDown={(event) => { if (event.target === event.currentTarget) setDebugOpen(false) }}>
+        <div className="debug-shell" role="dialog" aria-modal="true" aria-labelledby="debug-heading">
+          <div className="debug-top"><div className="debug-title"><span className="debug-badge" aria-hidden="true">⌁</span><div><h2 id="debug-heading">Realtime Debug</h2><p>Session diagnostics and voice pipeline events</p></div></div><button className="close-button" type="button" onClick={() => setDebugOpen(false)} aria-label="Close debug">×</button></div>
+          <div className="debug-content">
+            <div className="debug-column">
+              <section className="debug-card trace-card"><div className="debug-card-head"><h3>Voice response trace</h3><span>{selectedTurn ? `Turn ${selectedTurn.sequence}` : 'Waiting for a completed turn'}</span></div>
+                <div className="trace-summary"><div><span className="eyebrow">Voice response</span><strong>{formatMilliseconds(selectedLatency?.responseLatency ?? null)}</strong><small>{selectedLatency?.responseSource === 'native' ? 'Speech end → agent response begins · native server timing' : selectedLatency?.responseSource === 'worker_state_fallback' ? 'Speech end → agent speaking state · worker estimate' : 'No response timing available'}</small></div><div><span className="eyebrow">Slowest measured stage</span><strong>{bottleneck ? `${bottleneck.label} · ${formatMilliseconds(bottleneck.seconds)}` : '—'}</strong><small>{bottleneck?.hint ?? 'Awaiting stage measurements.'}</small></div></div>
+                {selectedTurn ? <>
+                  <div className="trace-flow">
+                    <div className="trace-boundary">User speech ended</div>
+                    {(selectedLatency?.finalTranscript !== undefined || selectedLatency?.turnDetection !== undefined) && <div className="trace-stage"><small>Both measured from speech end · may overlap</small>{selectedLatency.finalTranscript !== undefined && <div><span>Final transcript after speech</span><strong>{formatMilliseconds(selectedLatency.finalTranscript)}</strong></div>}{selectedLatency.turnDetection !== undefined && <div><span>Turn detection</span><strong>{formatMilliseconds(selectedLatency.turnDetection)}</strong></div>}</div>}
+                    {selectedLatency?.turnProcessing !== undefined && selectedLatency.turnProcessing >= 0.02 && <div className="trace-stage"><small>After turn accepted</small><div><span>Turn processing</span><strong>{formatMilliseconds(selectedLatency.turnProcessing)}</strong></div></div>}
+                    {(selectedLatency?.llmFirstToken !== undefined || selectedLatency?.firstSpeakableText !== undefined) && <div className="trace-stage"><small>Both measured from LLM start · may overlap</small>{selectedLatency.llmFirstToken !== undefined && <div><span>LLM first token</span><strong>{formatMilliseconds(selectedLatency.llmFirstToken)}</strong></div>}{selectedLatency.firstSpeakableText !== undefined && <div><span>First speakable text</span><strong>{formatMilliseconds(selectedLatency.firstSpeakableText)}</strong></div>}</div>}
+                    {selectedLatency?.ttsFirstAudio !== undefined && <div className="trace-stage"><small>After text reached TTS</small><div><span>TTS first audio</span><strong>{formatMilliseconds(selectedLatency.ttsFirstAudio)}</strong></div></div>}
+                    {selectedLatency?.audioOutputStart !== undefined && <div className="trace-stage"><small>Server audio output</small><div><span>Audio output start</span><strong>{formatMilliseconds(selectedLatency.audioOutputStart)}</strong></div></div>}
+                    <div className="trace-boundary">Agent response began</div>
+                  </div>
+                  <p className="trace-note">Each number uses its own start and end points. Final transcript and turn detection both start at speech end; first speakable text includes first-token time; turn processing includes agent logic. Do not add the rows together. Audio output start is server output timing, not browser-audible timing.</p>
+                  {selectedLatency?.finalTranscript !== undefined && selectedLatency.finalTranscript > 0.5 && <p className="trace-note">Final transcript took {formatMilliseconds(selectedLatency.finalTranscript)} after speech ended. Check STT finalization and provider latency.</p>}
+                  {speakableGap !== null && speakableGap > 0.2 && <p className="trace-note">First speakable text followed the first token by {formatMilliseconds(speakableGap)}. Check sentence buffering or response formatting.</p>}
+                </> : <p className="debug-empty">Complete a voice turn to see its timing trace.</p>}
+              </section>
+              {selectedTurn && <section className="debug-card"><div className="debug-card-head"><h3>Detailed measurements</h3><span>Only reported values</span></div><div className="measurement-scroll"><table className="measurement-table"><thead><tr><th>Measurement</th><th>Exact meaning</th><th>Value</th></tr></thead><tbody>{measurements.map((row) => <tr key={row.label}><th scope="row">{row.label}</th><td>{row.meaning}</td><td>{formatMilliseconds(row.value ?? null)}</td></tr>)}</tbody></table></div></section>}
+              {selectedLatency && (selectedLatency.stateAnalysis !== undefined || selectedLatency.strategySelection !== undefined) && <section className="debug-card"><div className="debug-card-head"><h3>Agent logic</h3><span>Separate from provider timing</span></div><dl className="detail-list">{selectedLatency.stateAnalysis !== undefined && <div><dt>State analysis call</dt><dd>{formatMilliseconds(selectedLatency.stateAnalysis)}</dd></div>}{selectedLatency.strategySelection !== undefined && <div><dt>Strategy selection</dt><dd>{formatMilliseconds(selectedLatency.strategySelection)}</dd></div>}</dl></section>}
+              {selectedInterruption && <section className="debug-card"><div className="debug-card-head"><h3>Interruption</h3><span>Interrupted speech {selectedInterruption.sequence}</span></div><div className="interruption-detail"><span>User speech detected → agent speaking state ended</span><strong>{formatMilliseconds(selectedInterruption.seconds)}</strong><small>Worker timing; this does not measure browser playback stop.</small></div></section>}
+            </div>
+            <div className="debug-column">
+              <section className="debug-card"><div className="debug-card-head"><h3>Recent completed turns</h3><span>Current session</span></div>{recentTurns.length ? <div className="turn-picker">{recentTurns.map((turn) => <button type="button" className={selectedTurn?.itemId === turn.itemId ? 'selected' : ''} key={turn.itemId} onClick={() => setSelectedTurnId(turn.itemId)}><span>Turn {turn.sequence}</span><strong>{formatMilliseconds(turn.latency.responseLatency ?? null)}</strong></button>)}</div> : <p className="debug-empty">No completed turns yet.</p>}</section>
+              <details className="debug-card advanced-card"><summary>Advanced technical debug</summary><dl className="detail-list">
+                <div><dt>Session ID</dt><dd>{roomName || '—'}</dd></div>
+                <div><dt>Speech ID</dt><dd>{selectedTurn?.speechId || '—'}</dd></div>
+                <div><dt>User item ID</dt><dd>{selectedTurn?.userItemId || '—'}</dd></div>
+                <div><dt>Assistant item ID</dt><dd>{selectedTurn?.itemId || '—'}</dd></div>
+                <div><dt>Turn sequence</dt><dd>{selectedTurn?.sequence ?? '—'}</dd></div>
+                <div><dt>Interrupted</dt><dd>{selectedTurn ? 'No · completed response' : '—'}</dd></div>
+                <div><dt>STT model</dt><dd>{providerModels.stt || '—'}</dd></div>
+                <div><dt>LLM model</dt><dd>{providerModels.llm || '—'}</dd></div>
+                <div><dt>TTS model</dt><dd>{providerModels.tts || '—'}</dd></div>
+                <div><dt>Voice response source</dt><dd>{selectedLatency?.responseSource || '—'}</dd></div>
+                <div><dt>LLM first token source</dt><dd>{selectedLatency?.llmFirstTokenSource || '—'}</dd></div>
+                <div><dt>TTS first audio source</dt><dd>{selectedLatency?.ttsFirstAudioSource || '—'}</dd></div>
+                <div><dt>Provider request IDs</dt><dd>{selectedLatency?.providerRequestIds?.join(', ') || '—'}</dd></div>
+                <div><dt>Additional metric updates</dt><dd>{selectedTurn?.additionalUpdates ?? '—'}</dd></div>
+                {selectedLatency?.turnProcessing !== undefined && selectedLatency.turnProcessing < 0.02 && <div><dt>Turn processing</dt><dd>{formatMilliseconds(selectedLatency.turnProcessing)}</dd></div>}
+              </dl></details>
+              <section className="debug-card"><div className="debug-card-head"><h3>Recent events</h3><span>Session timeline</span></div>{timeline.length ? <ol className="timeline">{timeline.map((event) => <li key={event.id}><span className="flow-dot" /><span>{event.text}</span><time>{event.time}</time></li>)}</ol> : <p className="debug-empty">No turn events yet.</p>}</section>
+              <section className="debug-card"><div className="debug-card-head"><h3>Session status</h3><span>Live state</span></div><dl className="detail-list"><div><dt>Backend</dt><dd>{backendStatus} <button className="text-button" type="button" onClick={() => setRetryAttempt((attempt) => attempt + 1)}>Retry</button></dd></div><div><dt>Session</dt><dd>{sessionStatus}</dd></div><div><dt>Connection</dt><dd>{connectionStatus}</dd></div><div><dt>Microphone</dt><dd>{microphoneStatus}</dd></div><div><dt>Remote audio</dt><dd>{audioPlayback}</dd></div><div><dt>User activity</dt><dd>{userActivity}</dd></div><div><dt>Agent activity</dt><dd>{agentActivity}</dd></div><div><dt>State analysis</dt><dd>{stateStatus}</dd></div></dl></section>
+              <section className="debug-card"><div className="debug-card-head"><h3>Errors</h3><span>Current session</span></div><div className="debug-errors">{activeErrors.length ? activeErrors.map((error, index) => <p key={index}>{error}</p>) : <p>No active errors.</p>}</div></section>
+            </div>
+          </div>
+        </div>
+      </div>}
     </div>
   )
 }

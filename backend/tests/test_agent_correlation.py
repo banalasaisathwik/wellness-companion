@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from src.agent import find_speech_owner
+from src.metrics import find_speech_owner
 
 
 def test_assistant_item_uses_owning_speech_handle() -> None:

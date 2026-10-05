@@ -1,7 +1,8 @@
-:root { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #252a42; background: #f7f8fc; font-synthesis: none; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; --bg: #f7f8fc; --surface: #fff; --ink: #252a42; --muted: #7e849a; --line: #e8eaf2; --purple: #7655c5; --teal: #278f85; --teal-soft: #e5f5f1; --shadow: 0 12px 45px rgba(33, 35, 65, .035); }
+:root { font-family: Georgia, 'Times New Roman', serif; color: #f4f2ef; background: #07101e; font-synthesis: none; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; --bg: #07101e; --muted: #b2bad0; --line: #657da151; --text: #f4f2ef; --cyan: #9dc9ff; --green: #a0e5c8; --red: #ff9ca9; --amber: #eac7a3; }
 * { box-sizing: border-box; }
-body { min-width: 320px; min-height: 100vh; margin: 0; background: var(--bg); }
+html { min-width: 320px; height: 100%; }
+body { min-width: 320px; height: 100dvh; margin: 0; overflow: hidden; background: #07101e; }
 button { font: inherit; }
-button:focus-visible, a:focus-visible { outline: 3px solid #cbb9f6; outline-offset: 3px; }
-#root { min-height: 100vh; }
+button:focus-visible { outline: 3px solid #80c9ee; outline-offset: 3px; }
+#root { height: 100dvh; min-height: 100dvh; overflow: hidden; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }

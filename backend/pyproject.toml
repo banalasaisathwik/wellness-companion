@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "livekit-agents>=1.8.3",
     "livekit-api>=1.2.1",
     "livekit-plugins-openai~=1.8.3",

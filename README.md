@@ -1,42 +1,21 @@
-# Voice Companion
+﻿# Voice Companion
 
-An in-progress real-time voice companion built with React, FastAPI, and
-LiveKit. Phase 2A keeps the Phase 1C browser microphone to LiveKit Inference
-AssemblyAI STT to OpenRouter LLM to LiveKit Inference Cartesia TTS conversation
-loop and adds turn-detection and endpointing visibility.
+A real-time conversational voice companion built with React, FastAPI, and LiveKit Agents. It offers general emotional support; it is not a therapist or medical system. This application does not persist conversations.
 
-It is a general supportive conversation experience, not a therapist,
-diagnostic system, medical device, or crisis-response service. Conversations
-are not persisted by this application.
-
-## Architecture
+## Voice flow
 
 ```text
-React browser -- POST /api/session --> FastAPI
-     |                                  |
-     | <--- room URL and participant JWT|
-     |                                  |-- dispatch companion-agent
-     v                                  v
-                       LiveKit room
-     microphone --> RoomIO / AgentSession --> LiveKit Inference STT
-                                                  |
-                                            OpenRouter LLM
-                                                  |
-                                            LiveKit Inference TTS
-                                                  |
-     browser speakers <--- LiveKit agent audio track
+Browser microphone → LiveKit room → AgentSession (Silero VAD + TurnDetector)
+  → AssemblyAI STT → committed user transcript
+  → Jev state analysis → text/acoustic fusion → conversation state → response strategy
+  → OpenRouter LLM → Cartesia TTS → LiveKit audio track → browser speakers
 ```
 
-`AgentSession` owns microphone input, Silero VAD and LiveKit TurnDetector turn
-handling, conversation history,
-LLM orchestration, native transcriptions, and agent audio publication. The
-frontend uses that same room for remote agent audio and native transcription
-events. The custom data channel carries only session state, turn timing and
-configuration, committed-item latency, usage summaries, and sanitized errors.
+`AgentSession` owns turn detection, interruption, generation, transcription, and agent audio publication. Acoustic observations use the same `AgentSession` audio input and only support conservative state fusion. The frontend receives native LiveKit transcripts and a small, room-scoped data payload for state, strategy, timing, and errors.
 
 ## Configure
 
-Copy `backend/.env.example` to `backend/.env.local`, then set real values:
+Copy `backend/.env.example` to `backend/.env.local` and set real values:
 
 ```dotenv
 LIVEKIT_URL=wss://your-project.livekit.cloud
@@ -44,18 +23,14 @@ LIVEKIT_API_KEY=your-api-key
 LIVEKIT_API_SECRET=your-api-secret
 OPENROUTER_API_KEY=your-openrouter-api-key
 LLM_MODEL=openai/gpt-4.1-mini
+JEV_MODEL=typesafe/jev-1.13
 ```
 
-`LLM_MODEL` is passed directly to OpenRouter. The worker does not configure
-automatic routing or a fallback model. LiveKit Inference uses the existing
-`LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET`, so no AssemblyAI, Cartesia, or
-Deepgram credential is required. TTS uses LiveKit's documented Cartesia
-Jacqueline voice (`9626c31c-bec5-4cca-baa8-f8ba9e84c8bc`). Keep backend
-credentials in `backend/.env.local`; React receives only a room-scoped LiveKit token.
+`LLM_MODEL` is sent to OpenRouter. LiveKit Inference uses the existing LiveKit credentials for AssemblyAI STT and Cartesia TTS. Keep credentials in `backend/.env.local`; the browser receives only a room-scoped LiveKit token.
 
 ## Run locally
 
-Start each process in a separate PowerShell terminal.
+Start each process in a separate PowerShell terminal:
 
 ```powershell
 Set-Location backend
@@ -74,101 +49,27 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Open the Vite URL (normally `http://localhost:5173`), create and connect a
-session, enable the microphone, and—if the browser asks—select **Enable audio**
-before expecting the agent's voice.
+Open the Vite URL, usually `http://localhost:5173`. Create a session, connect, and enable the microphone. If browser autoplay blocks remote audio, select **Enable audio**.
 
-## What the UI reports
+## What the UI shows
 
-- Native interim/final user transcripts and speech-synchronized agent text.
-- Committed user and assistant conversation items.
-- User and agent session state, including agent thinking and speaking.
-- Timestamped VAD speech-start/speech-end, committed user-item, agent-thinking,
-  and agent-speaking lifecycle events.
-- Current-turn speech span, end-of-turn decision delay, final-transcript delay,
-  and committed-item-to-agent-thinking delay.
-- The active Silero VAD, LiveKit TurnDetector model, and endpointing configuration,
-  including which values are configured versus inherited defaults.
-- The configured OpenRouter model.
-- Latest completed-turn latency, in milliseconds:
-  - **LLM first token** is `ChatMessage.metrics.llm_node_ttft`.
-  - **LLM generation** is the sum of non-cancelled OpenRouter plugin request durations for the response.
-  - **TTS first audio chunk** is `ChatMessage.metrics.tts_node_ttfb`.
-  - **TTS generation** is the sum of non-cancelled Cartesia plugin durations across streamed response segments.
-  - **Speech end → agent audio (server)** is `ChatMessage.metrics.e2e_latency`, from the SDK's detected end of user speech until RoomIO starts the agent's first audio frame.
-- Session usage summaries, provider errors, and a chronological event timeline.
+The main view shows connection and microphone controls, listening/thinking/speaking state, native transcripts, the current conversational state and chosen response strategy, and the latest measured response latency. The collapsible **Diagnostics** section contains endpointing delay, LLM time to first token, TTS time to first audio, conditional interruption stop timing, and a short turn timeline.
 
-These are server-side processing and RoomIO measurements. In particular,
-**Speech end → agent audio (server)** is not verified audible browser playback;
-browser buffering, network delivery, output routing, and autoplay permission
-remain outside that clock. The remote audio track stays attached across turns,
-so its `playing` event cannot reliably measure per-response audible latency.
+Response latency prefers LiveKit's `ChatMessage.metrics.e2e_latency`, measured from detected user speech end to the agent's first audio frame in the worker. If LiveKit omits that value, the UI labels an estimate from its user-speech-end and first-audio state events. Neither value measures when sound becomes audible in the browser. Endpointing is reported separately for its committed user item from `end_of_turn_delay`; it is not guessed from the response. LLM and TTS timings prefer the completed assistant item's native metrics; late provider first-token/first-audio callbacks are attached to that same assistant item. Full provider traces and usage belong in LiveKit Agent Insights.
 
-The earlier independent backend PCM reader, its `AudioStream` task lifecycle,
-and `peak_pcm` diagnostics were removed. The UI keeps microphone publication,
-AgentSession user-state indicators, and one local Web Audio input-level sample.
-It does not poll device settings or RTP sender statistics.
+The backend keeps `speech_id` and assistant item ownership so late events cannot replace a newer response. The frontend also rejects events from a prior room, retains detailed timings under their completed assistant item, and keeps the last valid response latency visible until a new measurement exists. Interruption stop timing is a worker-side interval shown only when LiveKit marks the response interrupted; it is not browser silence timing.
 
-Phase 2A Experiment 1 keeps Silero's `0.55` second minimum silence duration,
-sets turn detection to `inference.TurnDetector()`, and explicitly configures
-fixed endpointing with a `0.5` second minimum and `3.0` second maximum. It also
-keeps preemptive generation disabled. LiveKit Agents 1.8.3 uses tighter
-`0.3`/`2.5` second endpoint defaults for a streaming detector when delays are
-omitted; both delays and the fixed mode are explicitly supplied here. Silero
-remains required by TurnDetector and its existing silence duration exceeds the
-SDK's `0.25` second minimum.
-
-The UI's Phase 2A test area contains three manual scenarios. For Test A, record
-end-of-turn delay, speech end → agent audio, and LLM TTFT. For Test B, pause
-approximately one second between the phrases and check whether USER_TURN_COMMITTED
-or AGENT_THINKING occurs during the pause, or whether both phrases stay in one
-user turn. For Test C, record end-of-turn delay and the commit time after the
-long silence.
-
-### Manual comparison
-
-Record results from the same environment and providers for each configuration.
-Do not replace the earlier baseline sample with Experiment 1 results.
-
-| Configuration | EOT delay | Speech→audio | Hesitation result |
-| --- | --- | --- | --- |
-| VAD + fixed | baseline/manual | baseline/manual | baseline/manual |
-| TurnDetector + fixed | to test | to test | to test |
-
-## Checks
-
-Phase 2B explicitly requests LiveKit's adaptive interruption mode. The SDK
-still owns interruption, speech pause/resume, and cancellation. Its defaults
-remain enabled, 0.5 s minimum speech, 0 minimum words, a 2.0 s false
-interruption timeout, automatic false interruption resume, and a 1.0 s
-backchannel boundary at each end of agent speech. The streaming AssemblyAI
-STT and Silero VAD meet the SDK's adaptive path requirements. With the
-configured LiveKit credentials, the detector can use LiveKit Inference; the
-SDK falls back to VAD if detector creation or inference fails. The UI labels
-the configured mode and shows native overlap events when the adaptive detector
-actually makes a decision. A live microphone run is needed to verify that
-remote inference is available and to compare "OK" with the earlier baseline.
-
-During interruption, AgentSession decides whether to interrupt its current
-SpeechHandle, stops or pauses RoomIO audio output, and marks any forwarded
-assistant ChatMessage as interrupted. The React diagnostics display that
-native item flag, overlap verdict and detector timings, plus a local worker
-elapsed time from user speech start to the agent leaving `speaking`. That
-worker elapsed time does not measure when the browser speaker becomes silent.
-The five Checkpoint 2B acoustic scenarios are listed in the UI and require
-manual observation; no result is presumed.
+## Verify
 
 ```powershell
 Set-Location backend
-uv run python -m compileall src
+$env:PYTHONPATH='.'
+uv run pytest -q
 
 Set-Location ..\frontend
+node --experimental-strip-types --test tests/reliability.test.mjs
 npm.cmd run lint
 npm.cmd run build
 ```
 
-For a live check, verify a complete spoken turn, follow-up context, mute and
-unmute, disconnect during generation, reconnect, and that old-session events
-do not update the new view. Without valid LiveKit project and OpenRouter
-credentials, the worker reports the missing configuration in the room rather
-than claiming speech generation is available.
+With the API, worker, and frontend running, speak one complete turn and confirm the transcript, state/strategy, response audio, response latency, and detailed timings. Then test multiple turns, a real interruption, rapid short turns, reconnect, and a provider or connection error. Confirm that late metrics stay with their original response and that a prior room cannot update the new view. These live checks require working credentials, a microphone, and a browser session.

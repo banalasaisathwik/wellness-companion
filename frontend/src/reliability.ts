@@ -1,9 +1,54 @@
 export type TurnLatency = {
+  responseLatency?: number
+  responseSource?: 'native' | 'worker_state_fallback'
+  finalTranscript?: number
+  turnDetection?: number
+  turnProcessing?: number
   llmFirstToken?: number
-  llmDuration?: number
+  llmFirstTokenSource?: 'native' | 'provider'
+  firstSpeakableText?: number
   ttsFirstAudio?: number
-  ttsDuration?: number
-  speechEndToAgentAudio?: number
+  ttsFirstAudioSource?: 'native' | 'provider'
+  audioOutputStart?: number
+  stateAnalysis?: number
+  strategySelection?: number
+  providerRequestIds?: string[]
+}
+
+export type CompletedTurn = {
+  itemId: string
+  speechId: string
+  userItemId?: string
+  sequence: number
+  latency: TurnLatency
+  additionalUpdates?: number
+}
+
+export function updateRecentTurns(turns: CompletedTurn[], incoming: CompletedTurn): CompletedTurn[] {
+  const previous = turns.find((turn) => turn.itemId === incoming.itemId)
+  return [
+    ...turns.filter((turn) => turn.itemId !== incoming.itemId),
+    {
+      ...incoming,
+      userItemId: incoming.userItemId ?? previous?.userItemId,
+      additionalUpdates: (previous?.additionalUpdates ?? 0) + (previous ? 1 : 0),
+    },
+  ].sort((first, second) => second.sequence - first.sequence).slice(0, 5)
+}
+
+export function slowestStage(latency: TurnLatency): { label: string; seconds: number; hint: string } | null {
+  const stages = [
+    { label: 'Turn detection', seconds: latency.turnDetection, hint: latency.finalTranscript !== undefined
+      && latency.turnDetection !== undefined && latency.finalTranscript >= latency.turnDetection * 0.7
+      ? 'Check STT finalization and turn detection.' : 'Check endpointing and turn-detection settings.' },
+    { label: 'Turn processing', seconds: latency.turnProcessing, hint: latency.stateAnalysis !== undefined
+      && latency.turnProcessing !== undefined && latency.stateAnalysis >= latency.turnProcessing * 0.7
+      ? 'Check the state-analysis call before generation.' : 'Check work in the user-turn callback.' },
+    { label: 'LLM first token', seconds: latency.llmFirstToken, hint: 'Check model/provider first-token time and prompt size.' },
+    { label: 'TTS first audio', seconds: latency.ttsFirstAudio, hint: 'Check the TTS provider/model and streaming configuration.' },
+  ]
+  const available = stages.filter((stage): stage is { label: string; seconds: number; hint: string } => stage.seconds !== undefined)
+  return available.length ? available.reduce((slowest, stage) => stage.seconds > slowest.seconds ? stage : slowest) : null
 }
 
 export type AssistantItem = {

@@ -40,7 +40,7 @@ def create_session() -> dict[str, str]:
                 room=room_name,
                 can_publish=True,
                 can_subscribe=True,
-                can_publish_data=False,
+                can_publish_data=True,
                 can_publish_sources=["microphone"],
             )
         )

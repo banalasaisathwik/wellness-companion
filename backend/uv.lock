@@ -189,6 +189,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "livekit-agents" },
     { name = "livekit-api" },
     { name = "livekit-plugins-openai" },
@@ -205,6 +206,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "livekit-agents", specifier = ">=1.8.3" },
     { name = "livekit-api", specifier = ">=1.2.1" },
     { name = "livekit-plugins-openai", specifier = "~=1.8.3" },
