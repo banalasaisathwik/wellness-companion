@@ -81,7 +81,8 @@ export function removeRoomEventListeners(room: Room, handlers: RoomEventHandlers
 }
 
 export async function requestSession(signal: AbortSignal): Promise<SessionCredentials | null> {
-  const response = await fetch('/api/session', { method: 'POST', signal })
+  const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '')
+  const response = await fetch(`${apiBaseUrl}/session`, { method: 'POST', signal })
   if (!response.ok) throw new Error('The session could not be created.')
   const session = (await response.json()) as SessionCredentials
   if (signal.aborted) return null
