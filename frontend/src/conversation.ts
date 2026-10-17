@@ -1,3 +1,5 @@
+import type { ConversationState } from './voice/types'
+
 export type ConversationMessage = {
   id: string
   itemId?: string
@@ -34,4 +36,17 @@ export function updateTranscript(
     final: Boolean(message.itemId) || segments.every((part) => part.final),
   }
   return messages.map((item, position) => position === index ? updated : item)
+}
+
+export function readConversationState(value: unknown): ConversationState | null {
+  if (!value || typeof value !== 'object') return null
+  const state = value as Record<string, unknown>
+  const allowed: Record<keyof ConversationState, string[]> = {
+    energy: ['LOW', 'MEDIUM', 'HIGH', 'UNKNOWN'],
+    stress: ['LOW', 'MEDIUM', 'HIGH', 'UNKNOWN'],
+    frustration: ['LOW', 'MEDIUM', 'HIGH', 'UNKNOWN'],
+    sentiment: ['NEGATIVE', 'NEUTRAL', 'POSITIVE', 'UNKNOWN'],
+  }
+  if ((Object.keys(allowed) as (keyof ConversationState)[]).some((key) => !allowed[key].includes(state[key] as string))) return null
+  return state as ConversationState
 }

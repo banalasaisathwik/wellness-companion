@@ -1,6 +1,6 @@
 from livekit.agents import llm
 
-from src.conversation.respond import STRATEGY_INSTRUCTIONS, generate_response_instructions, update_turn_instructions
+from src.conversation.strategy import STRATEGY_INSTRUCTIONS, generate_response_instructions, update_turn_instructions
 from src.conversation.state import ChoiceResult, TurnAnalysis, TurnState
 from src.conversation.strategy import Strategy
 from src.conversation.strategy import choose_strategy

@@ -49,5 +49,23 @@ test('slowest stage compares independent timings and gives a deterministic hint'
   assert.equal(slowestStage({ turnDetection: 0.8, finalTranscript: 0.7, llmFirstToken: 0.2, ttsFirstAudio: 0.1 })?.label, 'Turn detection')
   assert.match(slowestStage({ turnDetection: 0.8, finalTranscript: 0.7 })?.hint ?? '', /STT finalization/)
   assert.equal(slowestStage({ turnDetection: 0.2, llmFirstToken: 0.9, ttsFirstAudio: 0.15 })?.label, 'LLM first token')
-  assert.equal(slowestStage({ turnProcessing: 0.9, stateAnalysis: 0.8 })?.label, 'Turn processing')
+  assert.equal(slowestStage({ turnProcessing: 0.9, agentLogicMetrics: { jevClassification: 0.8 } })?.label, 'Turn processing')
+})
+
+test('late agent logic updates merge into their owning turn without replacing native metrics', () => {
+  const latencies = new Map()
+  let latest = mergeTurnMetrics(latencies, null, 'assistant-1', 1, true,
+    { turnProcessing: 3.2, responseLatency: 5.1 })
+  latest = mergeTurnMetrics(latencies, latest.latestCompleted, 'assistant-2', 2, true,
+    { turnProcessing: 2.1, responseLatency: 3.8 })
+  const late = mergeTurnMetrics(latencies, latest.latestCompleted, 'assistant-1', 1, true,
+    { agentLogicMetrics: { jevClassification: 3.1, stateParsing: 0.002 } })
+  mergeTurnMetrics(latencies, late.latestCompleted, 'assistant-1', 1, true,
+    { agentLogicMetrics: { strategySelection: 0.0003 } })
+  assert.equal(late.visibleLatency, null)
+  assert.deepEqual(latencies.get('assistant-1'), {
+    turnProcessing: 3.2, responseLatency: 5.1,
+    agentLogicMetrics: { jevClassification: 3.1, stateParsing: 0.002, strategySelection: 0.0003 },
+  })
+  assert.deepEqual(latencies.get('assistant-2'), { turnProcessing: 2.1, responseLatency: 3.8 })
 })

@@ -6,7 +6,7 @@ from unittest.mock import patch
 from livekit import rtc
 from livekit.agents.voice.io import AudioInput
 
-from src import acoustics
+from src.conversation import features
 from src.acoustics import AcousticAudioInput
 
 
@@ -50,7 +50,7 @@ def test_weighted_turn_rms_and_frame_passthrough() -> None:
         assert summary["peak_energy"] == 0.5
         assert acoustic_input.finish_turn("four normal spoken words") is None
 
-    with patch.object(acoustics.time, "monotonic", side_effect=lambda: clock[0]):
+    with patch.object(features.time, "monotonic", side_effect=lambda: clock[0]):
         asyncio.run(read_frames())
 
 
@@ -73,7 +73,7 @@ def test_partial_revisions_are_replaced_and_final_rate_uses_final_words() -> Non
         assert summary["speech_rate_wpm"] == 90
         assert acoustic_input.partial_transcript == ""
 
-    with patch.object(acoustics.time, "monotonic", side_effect=lambda: clock[0]):
+    with patch.object(features.time, "monotonic", side_effect=lambda: clock[0]):
         asyncio.run(read_turn())
 
 
@@ -81,7 +81,7 @@ def test_short_silence_between_speech_segments_counts_inside_turn() -> None:
     acoustic_input = AcousticAudioInput(FrameSource([]))
     clock = [0.0]
 
-    with patch.object(acoustics.time, "monotonic", side_effect=lambda: clock[0]):
+    with patch.object(features.time, "monotonic", side_effect=lambda: clock[0]):
         acoustic_input.speech_started()
         clock[0] = 1.0
         acoustic_input.speech_ended()
@@ -129,7 +129,7 @@ def test_internal_pause_changes_speaking_rate_but_not_articulation_rate() -> Non
         assert acoustic_input.baseline[-1]["pause_ratio"] == 0
         assert acoustic_input.baseline[-1]["speaking_rate_wpm"] == 120
 
-    with patch.object(acoustics.time, "monotonic", side_effect=lambda: clock[0]):
+    with patch.object(features.time, "monotonic", side_effect=lambda: clock[0]):
         asyncio.run(read_frames())
 
 
@@ -171,5 +171,5 @@ def test_baseline_warms_up_excludes_short_reply_and_compares_before_update() -> 
         assert slow["speech_rate_delta"] == -0.5
         assert len(acoustic_input.baseline) == 4
 
-    with patch.object(acoustics.time, "monotonic", side_effect=lambda: clock[0]):
+    with patch.object(features.time, "monotonic", side_effect=lambda: clock[0]):
         asyncio.run(read_frames())

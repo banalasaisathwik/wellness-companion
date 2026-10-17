@@ -1,6 +1,6 @@
 import pytest
 
-from src.conversation.analyze import validate_answers
+from src.conversation.state import validate_answers
 from src.conversation.state import (
     STATE_STALE_AFTER_TURNS,
     ChoiceResult,
