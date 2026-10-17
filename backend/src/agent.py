@@ -37,7 +37,8 @@ else:
 load_dotenv(Path(__file__).resolve().parents[1] / ".env.local")
 
 logger = logging.getLogger("voice_companion.agent")
-server = AgentServer()
+# Bound the idle pool and allow cold imports/prewarm on Render's shared CPU.
+server = AgentServer(num_idle_processes=1, initialize_process_timeout=60.0)
 
 COMPANION_INSTRUCTIONS = """
 You are a warm, general emotional-support companion. Listen carefully and reply
@@ -53,10 +54,30 @@ PREEMPTIVE_GENERATION_ENABLED = False
 
 def prewarm(process: JobProcess) -> None:
     # Silero loads an ONNX model, so do it before the worker accepts a room job.
-    process.userdata["vad"] = create_vad()
+    started = time.perf_counter()
+    logger.info("Silero VAD prewarm started pid=%s", os.getpid())
+    try:
+        process.userdata["vad"] = create_vad()
+    except Exception:
+        logger.exception("Silero VAD prewarm failed pid=%s", os.getpid())
+        raise
+    logger.info(
+        "Silero VAD prewarm completed pid=%s duration_seconds=%.3f",
+        os.getpid(), time.perf_counter() - started,
+    )
 
 
 server.setup_fnc = prewarm
+
+
+@server.on("worker_started")
+def on_worker_started() -> None:
+    logger.info("agent worker started idle_processes=1 initialize_timeout_seconds=60")
+
+
+@server.on("worker_registered")
+def on_worker_registered(worker_id: str, server_info: object) -> None:
+    logger.info("LiveKit worker registered agent_name=companion-agent")
 
 
 @server.rtc_session(agent_name="companion-agent")
