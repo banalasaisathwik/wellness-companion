@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from livekit import api
 
 
@@ -12,6 +13,14 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env.local")
 
 
 app = FastAPI()
+
+frontend_origins = [origin.strip() for origin in os.getenv('FRONTEND_ORIGIN', '').split(',') if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=frontend_origins,
+    allow_methods=['POST', 'OPTIONS'],
+    allow_headers=['Content-Type'],
+)
 
 
 @app.get("/health")
