@@ -202,8 +202,12 @@ function App() {
       setRoomName(session.room_name)
       setSessionStatus('Session created')
       return session
-    } catch {
-      if (!signal.aborted) setSessionStatus('Unable to create a session. Check the backend configuration.')
+    } catch (error) {
+      if (!signal.aborted) {
+        const message = sanitizeError(error instanceof Error ? error.message : 'Unable to create a session.')
+        setSessionStatus(`Unable to create a session: ${message}`)
+        throw new Error(message, { cause: error })
+      }
       return null
     }
   }
@@ -624,7 +628,7 @@ function App() {
       disconnectRoom()
       setStartupError(message)
       setStartupState('error')
-    }, 20000)
+    }, 150000) // Render Free wake-up plus a cold job process can exceed one minute.
     try {
       const session = await createSession(abortController.signal)
       if (attempt !== startAttemptRef.current) return
@@ -667,6 +671,8 @@ function App() {
           case 'agent':
             message = 'Luna disconnected. Try again.'
             break
+          default:
+            message = sanitizeError(error.message)
         }
       }
       disconnectRoom()

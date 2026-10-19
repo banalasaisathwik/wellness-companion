@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+import httpx
 from livekit import api
 
 
@@ -20,13 +21,26 @@ def health() -> dict[str, str]:
 
 
 @app.post("/session")
-def create_session() -> dict[str, str]:
+async def create_session() -> dict[str, str]:
     server_url = os.getenv("LIVEKIT_URL")
     api_key = os.getenv("LIVEKIT_API_KEY")
     api_secret = os.getenv("LIVEKIT_API_SECRET")
 
     if not server_url or not api_key or not api_secret:
         raise HTTPException(status_code=503, detail="LiveKit is not configured.")
+
+    if worker_url := os.getenv("VOICE_WORKER_HEALTH_URL"):
+        try:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
+                health = await client.get(worker_url)
+                health.raise_for_status()
+                worker = await client.get(f"{worker_url}/worker")
+                worker.raise_for_status()
+                active_jobs = worker.json().get("active_jobs", 0)
+        except (httpx.HTTPError, ValueError):
+            raise HTTPException(status_code=503, detail="Luna is still starting. Please try again shortly.") from None
+        if active_jobs >= 1:
+            raise HTTPException(status_code=409, detail="Luna is in another session. Please try again when it ends.")
 
     room_name = f"voice-companion-{uuid4().hex}"
     participant_identity = f"participant-{uuid4().hex}"

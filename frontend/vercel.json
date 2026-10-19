@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://luna-voice-api.onrender.com/:path*"
+    }
+  ]
+}

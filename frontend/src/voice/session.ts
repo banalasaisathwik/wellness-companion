@@ -81,10 +81,21 @@ export function removeRoomEventListeners(room: Room, handlers: RoomEventHandlers
 }
 
 export async function requestSession(signal: AbortSignal): Promise<SessionCredentials | null> {
-  const response = await fetch('/api/session', { method: 'POST', signal })
-  if (!response.ok) throw new Error('The session could not be created.')
-  const session = (await response.json()) as SessionCredentials
-  if (signal.aborted) return null
-  if (!session.server_url || !session.token || !session.room_name) throw new Error('Incomplete session response.')
-  return session
+  for (let attempt = 0; ; attempt += 1) {
+    signal.throwIfAborted()
+    const response = await fetch('/api/session', { method: 'POST', signal })
+    if (!response.ok) {
+      const error = await response.json().catch(() => null) as { detail?: string } | null
+      const message = typeof error?.detail === 'string' ? error.detail : 'The session could not be created.'
+      if (response.status === 503 && message.startsWith('Luna is still starting.') && attempt < 30) {
+        await new Promise((resolve) => setTimeout(resolve, 2000))
+        continue
+      }
+      throw new Error(message)
+    }
+    const session = (await response.json()) as SessionCredentials
+    if (signal.aborted) return null
+    if (!session.server_url || !session.token || !session.room_name) throw new Error('Incomplete session response.')
+    return session
+  }
 }

@@ -37,8 +37,19 @@ else:
 load_dotenv(Path(__file__).resolve().parents[1] / ".env.local")
 
 logger = logging.getLogger("voice_companion.agent")
-# Bound the idle pool and allow cold imports/prewarm on Render's shared CPU.
-server = AgentServer(num_idle_processes=1, initialize_process_timeout=60.0)
+# One active room, no spare child: keep the free 512 MB instance bounded.
+def worker_load(worker: AgentServer) -> float:
+    return float(len(worker.active_jobs))
+
+
+server = AgentServer(
+    num_idle_processes=0,
+    initialize_process_timeout=60.0,
+    load_fnc=worker_load,
+    load_threshold=0.5,
+    host="127.0.0.1",
+    port=8081,
+)
 
 COMPANION_INSTRUCTIONS = """
 You are a warm, general emotional-support companion. Listen carefully and reply
@@ -72,7 +83,7 @@ server.setup_fnc = prewarm
 
 @server.on("worker_started")
 def on_worker_started() -> None:
-    logger.info("agent worker started idle_processes=1 initialize_timeout_seconds=60")
+    logger.info("agent worker started idle_processes=0 max_active_rooms=1 initialize_timeout_seconds=60")
 
 
 @server.on("worker_registered")

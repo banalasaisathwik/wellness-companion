@@ -30,7 +30,8 @@ def create_tts():
 
 
 def create_turn_detector():
-    return inference.TurnDetector()
+    # Production outside LiveKit Cloud otherwise defaults to the local mini model.
+    return inference.TurnDetector(version="v1", local_fallback=False)
 
 
 def create_stt():

@@ -2,7 +2,20 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import test from 'node:test'
 import { ConnectionState, RoomEvent } from 'livekit-client'
-import { waitForAgentReady } from '../src/voice/session.ts'
+import { requestSession, waitForAgentReady } from '../src/voice/session.ts'
+
+test('session creation surfaces a busy worker response', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response(
+    JSON.stringify({ detail: 'Luna is in another session. Please try again when it ends.' }),
+    { status: 409 },
+  ))
+  await assert.rejects(requestSession(signal()), /another session/)
+})
+
+test('a missing API rewrite gives a usable error even for an HTML response', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('<html>Not found</html>', { status: 404 }))
+  await assert.rejects(requestSession(signal()), /session could not be created/)
+})
 
 function connectedRoom() {
   const room = new EventEmitter()

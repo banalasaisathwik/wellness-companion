@@ -51,6 +51,10 @@ def stop_processes(
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # 1.8.6 honors this before the forkserver/job image preloads local models.
+    # The cloud turn detector must not silently load mini weights on this instance.
+    os.environ.setdefault("LIVEKIT_AGENTS_PRELOAD_LOCAL_INFERENCE", "0")
+    os.environ["VOICE_WORKER_HEALTH_URL"] = "http://127.0.0.1:8081"
     shutdown_signal = None
 
     def request_shutdown(signum: int, frame: object) -> None:
@@ -65,6 +69,7 @@ def main() -> int:
     processes: list[tuple[str, subprocess.Popen]] = []
     commands = (
         ("FastAPI", [sys.executable, "-u", "-m", "uvicorn", "src.api:app",
+                     "--workers", "1",
                      "--host", "0.0.0.0", "--port", os.environ.get("PORT") or "10000"]),
         ("LiveKit agent", [sys.executable, "-u", "src/agent.py", "start"]),
     )
@@ -80,6 +85,7 @@ def main() -> int:
             processes.append((name, process))
             logger.info("launched %s pid=%s", name, process.pid)
 
+        next_memory_log = 0.0
         while shutdown_signal is None:
             for name, process in processes:
                 return_code = process.poll()
@@ -89,6 +95,14 @@ def main() -> int:
                     if return_code < 0:
                         return 128 - return_code
                     return return_code or 1
+            if time.monotonic() >= next_memory_log:
+                try:
+                    current = int(Path("/sys/fs/cgroup/memory.current").read_text())
+                    limit = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+                    logger.info("container memory current_mb=%.1f limit_bytes=%s", current / 1024**2, limit)
+                except (OSError, ValueError):
+                    pass  # cgroup v2 is not present in local Windows development.
+                next_memory_log = time.monotonic() + 30.0
             time.sleep(0.1)
         logger.info("launcher received %s", signal.Signals(shutdown_signal).name)
         exit_code = 0

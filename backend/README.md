@@ -1,5 +1,38 @@
 # Backend deployment on one Render Free web service
 
+## Current free-instance configuration
+
+LiveKit Agents and the OpenAI/Silero plugins are locked to **1.8.6**. The launcher
+sets `LIVEKIT_AGENTS_PRELOAD_LOCAL_INFERENCE=0` before starting either child.
+This version honors the flag; 1.8.3 did not. Turn detection explicitly uses
+cloud `v1` with `local_fallback=False`, so it cannot load the local mini model
+when the gateway fails. This requires LiveKit Inference access.
+
+The worker keeps **zero idle processes** and reports full load while one room
+is active. The SDK also reserves pending assignments before launching jobs.
+Silero still loads once in the room job. The worker's internal health endpoint
+listens only on `127.0.0.1:8081`; FastAPI remains on Render's public `$PORT`.
+In the combined launcher, `/session` checks that the worker is reachable and
+returns 503 during startup or 409 while busy instead of returning a misleading
+successful token response. `/health` remains API liveness only.
+
+Every 30 seconds the launcher logs cgroup memory usage when available. Verify
+the container stays below its 512 MB limit during startup, a call, and cleanup;
+an idle successful deploy alone does not establish memory safety.
+
+Vercel uses root directory `frontend`, build `npm run build`, output `dist`,
+and production branch `master`, matching Render. `frontend/vercel.json` forwards
+`/api/*` to this Render service. The browser permits 150 seconds for cold startup
+and retries the worker's explicit starting response for up to 60 seconds.
+
+Flow: browser → Vercel `/api/session` rewrite → Render API → LiveKit room token
+and named dispatch → one cold worker job → `listening` event → microphone.
+If the worker dies, the launcher stops both processes so Render restarts the
+service. Do not replace `python start.py` with an API-only Uvicorn command.
+
+The older initialization investigation below describes the previous 1.8.3
+deployment and its unsuccessful one-idle-process configuration.
+
 Use Render's Python runtime with **Root Directory: `backend`**. Keep Python
 3.13 (the existing `.python-version` selects it for uv). If Render has a
 `PYTHON_VERSION` override, it must be a fully qualified 3.13 patch release;
